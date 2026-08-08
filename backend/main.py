@@ -27,9 +27,18 @@ from modules.logger import get_logger, request_log
 from modules.models import (
     CameraModel,
     MatcherType,
+    MVSCommand,
+    MVSConfig,
     PipelineConfig,
     PipelineStep,
     TaskStatus,
+)
+from modules.mvs_runner import (
+    build_mvs_command,
+    get_mvs_process,
+    is_mvs_running,
+    remove_mvs_process,
+    run_mvs_async,
 )
 from modules.sam_runner import (
     build_sam_command,
@@ -40,6 +49,7 @@ from modules.sam_runner import (
 )
 from modules.task_manager import (
     _input_image_dir,
+    _mvs_output_dir,
     _sfm_output_dir,
     count_images,
     create_project,
@@ -128,6 +138,7 @@ def _start_pipeline(project_name: str) -> None:
         no_geom_consistency=config_dict.get("no_geom_consistency", False),
         reconstruction_name=config_dict.get("reconstruction_name", "0"),
         vocab_tree_path=config_dict.get("vocab_tree_path"),
+        convert_output_suffix=config_dict.get("convert_output_suffix", "txt"),
     )
 
     logger.info("Project %r starting pipeline: %s", project_name, " ".join(cmd))
@@ -308,6 +319,7 @@ async def run_pipeline(
     max_num_features: int = Form(default=8192),
     no_geom_consistency: bool = Form(default=False),
     reconstruction_name: str = Form(default="0"),
+    convert_output_suffix: str = Form(default="txt"),
 ):
     """Configure and run the SfM pipeline for a project."""
     p = get_project(project_name)
@@ -337,6 +349,7 @@ async def run_pipeline(
         max_num_features=max_num_features,
         no_geom_consistency=no_geom_consistency,
         reconstruction_name=reconstruction_name,
+        convert_output_suffix=convert_output_suffix,
     )
 
     update_project(project_name, config=config.model_dump())
@@ -508,6 +521,175 @@ async def get_sam_log(project_name: str, lines: int = 100):
         return {"project_name": project_name, "log": "".join(all_lines[-lines:])}
     except OSError:
         return {"project_name": project_name, "log": "(error reading log)"}
+
+
+# ---------------------------------------------------------------------------
+# Helpers — MVS
+# ---------------------------------------------------------------------------
+
+
+def _check_mvs_completion(project_name: str) -> None:
+    """If the MVS process for project has exited, update status."""
+    proc = get_mvs_process(project_name)
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        if proc.returncode == 0:
+            logger.info("Project %r MVS finished successfully", project_name)
+        else:
+            logger.error("Project %r MVS FAILED (exit code %s)", project_name, proc.returncode)
+        remove_mvs_process(project_name)
+
+
+# ---------------------------------------------------------------------------
+# API Routes — MVS
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/projects/{project_name}/mvs/run")
+async def run_mvs_pipeline(
+    project_name: str,
+    command: str = Form(default="pipeline"),
+    model: str = Form(default="0"),
+    resolution_level: int = Form(default=1),
+    max_resolution: int = Form(default=3200),
+    min_resolution: int = Form(default=640),
+    number_views: int = Form(default=5),
+    no_cuda: bool = Form(default=False),
+    refine_resolution: int = Form(default=1),
+    scales: int = Form(default=2),
+    gradient_step: float = Form(default=45.0),
+    texture_resolution: int = Form(default=1),
+    export_type: str = Form(default="ply"),
+):
+    """Run an OpenMVS pipeline step for a project."""
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+    if is_mvs_running(project_name):
+        raise HTTPException(400, "MVS pipeline is already running")
+
+    # Validate command
+    if command not in {c.value for c in MVSCommand}:
+        raise HTTPException(400, f"Invalid MVS command: {command}. Choices: {[c.value for c in MVSCommand]}")
+
+    if export_type not in ("ply", "obj"):
+        raise HTTPException(400, "export_type must be 'ply' or 'obj'")
+
+    config = MVSConfig(
+        command=MVSCommand(command),
+        model=model,
+        resolution_level=resolution_level,
+        max_resolution=max_resolution,
+        min_resolution=min_resolution,
+        number_views=number_views,
+        no_cuda=no_cuda,
+        refine_resolution=refine_resolution,
+        scales=scales,
+        gradient_step=gradient_step,
+        texture_resolution=texture_resolution,
+        export_type=export_type,
+    )
+    update_project(project_name, mvs_config=config.model_dump())
+
+    cmd = build_mvs_command(
+        project_name,
+        command=command,
+        model=model,
+        resolution_level=resolution_level,
+        max_resolution=max_resolution,
+        min_resolution=min_resolution,
+        number_views=number_views,
+        no_cuda=no_cuda,
+        refine_resolution=refine_resolution,
+        scales=scales,
+        gradient_step=gradient_step,
+        texture_resolution=texture_resolution,
+        export_type=export_type,
+    )
+
+    logger.info("Project %r: starting MVS %s", project_name, command)
+    await asyncio.to_thread(run_mvs_async, project_name, cmd)
+
+    return {
+        "success": True,
+        "message": f"MVS {command} started for {project_name}",
+        "data": {"command": command},
+    }
+
+
+@app.get("/api/projects/{project_name}/mvs/log")
+async def get_mvs_log(project_name: str, lines: int = 100):
+    """Get MVS pipeline log."""
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    log_path = _mvs_output_dir(project_name) / "mvs_pipeline.log"
+    if not log_path.exists():
+        return {"project_name": project_name, "log": "(no log yet)"}
+
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+        return {"project_name": project_name, "log": "".join(all_lines[-lines:])}
+    except OSError:
+        return {"project_name": project_name, "log": "(error reading log)"}
+
+
+@app.get("/api/projects/{project_name}/mvs/result")
+async def get_mvs_result(project_name: str):
+    """Get MVS pipeline result (mvs_pipeline_result.json)."""
+    _check_mvs_completion(project_name)
+
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    from modules.task_manager import _mvs_result_json
+    result_path = _mvs_result_json(project_name)
+
+    if not result_path.exists():
+        return {
+            "project_name": project_name,
+            "ready": False,
+            "message": "No MVS results yet. Run MVS pipeline first.",
+        }
+
+    try:
+        with open(result_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"project_name": project_name, "ready": False, "message": "Failed to parse MVS results."}
+
+    return {
+        "project_name": project_name,
+        "ready": True,
+        "status": data.get("status"),
+        "project": data.get("project"),
+        "steps": data.get("steps", {}),
+        "total_elapsed": data.get("total_elapsed"),
+    }
+
+
+@app.get("/api/projects/{project_name}/mvs/download/{filename:path}")
+async def download_mvs_file(project_name: str, filename: str):
+    """Download a result file from MVS_output directory."""
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    mvs_dir = _mvs_output_dir(project_name)
+    safe_path = os.path.normpath(filename)
+    if safe_path.startswith("..") or safe_path.startswith("/"):
+        raise HTTPException(400, "Invalid filename")
+
+    file_path = mvs_dir / safe_path
+    if not file_path.exists():
+        raise HTTPException(404, f"File not found: {filename}")
+
+    return FileResponse(file_path, filename=Path(filename).name,
+                        media_type="application/octet-stream")
 
 
 # ---------------------------------------------------------------------------

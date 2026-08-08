@@ -52,6 +52,15 @@ def _result_json(project_name: str) -> Path:
     return _sfm_output_dir(project_name) / "pipeline_result.json"
 
 
+def _mvs_output_dir(project_name: str) -> Path:
+    return _project_dir(project_name) / "MVS_output"
+
+
+def _mvs_result_json(project_name: str) -> Path:
+    """Path to mvs_pipeline_result.json (inside MVS_output)."""
+    return _mvs_output_dir(project_name) / "mvs_pipeline_result.json"
+
+
 def _log_path(project_name: str) -> Path:
     """Path to pipeline.log (inside SFM_output)."""
     return _sfm_output_dir(project_name) / "pipeline.log"

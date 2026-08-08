@@ -38,6 +38,7 @@ def build_sfm_command(
     no_geom_consistency: bool = False,
     reconstruction_name: str = "0",
     vocab_tree_path: str | None = None,
+    convert_output_suffix: str = "txt",
 ) -> list[str]:
     """Build the docker exec command to run sfm_cli.py inside the container.
 
@@ -63,8 +64,11 @@ def build_sfm_command(
         "--gpu_index", str(gpu_index),
         "--max_num_features", str(max_num_features),
         "--reconstruction_name", reconstruction_name,
+        "--no_clean",
     ]
 
+    if convert_output_suffix:
+        cmd += ["--convert_output_suffix", convert_output_suffix]
     if no_geom_consistency:
         cmd.append("--no_geom_consistency")
     if vocab_tree_path:

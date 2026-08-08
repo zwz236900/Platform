@@ -43,6 +43,17 @@ class PipelineStep(str, Enum):
     UNDISTORT = "undistort"
     MVS = "mvs"
     FUSION = "fusion"
+    CONVERT = "convert"
+
+
+class MVSCommand(str, Enum):
+    PIPELINE = "pipeline"
+    INTERFACE = "interface"
+    DENSIFY = "densify"
+    RECONSTRUCT = "reconstruct"
+    REFINE = "refine"
+    TEXTURE = "texture"
+    CHECK = "check"
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +76,23 @@ class PipelineConfig(BaseModel):
     no_geom_consistency: bool = Field(default=False)
     reconstruction_name: str = Field(default="0")
     vocab_tree_path: Optional[str] = Field(default=None)
+    convert_output_suffix: str = Field(default="txt", description="Output format for model_converter step (txt or bin)")
+
+
+class MVSConfig(BaseModel):
+    """Configuration for the OpenMVS pipeline."""
+    command: MVSCommand = Field(default=MVSCommand.PIPELINE)
+    model: str = Field(default="0", description="SFM model name")
+    resolution_level: int = Field(default=1, ge=1, description="Downsample level")
+    max_resolution: int = Field(default=3200, ge=1)
+    min_resolution: int = Field(default=640, ge=1)
+    number_views: int = Field(default=5, ge=1, description="Views for depth estimation")
+    no_cuda: bool = Field(default=False)
+    refine_resolution: int = Field(default=1, ge=1)
+    scales: int = Field(default=2, ge=1)
+    gradient_step: float = Field(default=45.0)
+    texture_resolution: int = Field(default=1, ge=1)
+    export_type: str = Field(default="ply")
 
 
 # ---------------------------------------------------------------------------
