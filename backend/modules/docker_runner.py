@@ -80,6 +80,20 @@ def build_sfm_command(
 _SUPPORTED_EXTS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".pgm", ".ppm")
 
 
+def is_container_running() -> bool:
+    """Check whether the colmap-dev container is currently running."""
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", CONTAINER_NAME],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result.stdout.strip() == "true"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
 def preprocess_images(project_name: str) -> dict:
     """Strip all metadata (IPTC/EXIF) from uploaded images inside the colmap-dev container.
 
@@ -91,8 +105,16 @@ def preprocess_images(project_name: str) -> dict:
         processed (int) — number of files actually touched
         error (str | None) — error message if the command failed
     """
-    image_dir = DATA_DIR_CONTAINER / project_name / "Input" / "input_image"
     log = get_logger(__name__)
+
+    if not is_container_running():
+        log.warning("Project %r: colmap-dev container not running — skip preprocessing", project_name)
+        return {"success": False, "processed": 0, "error": "container not running"}
+
+    image_dir = DATA_DIR_CONTAINER / project_name / "Input" / "input_image"
+    if not (DATA_DIR_HOST / project_name / "Input" / "input_image").is_dir():
+        log.info("Project %r: input_image dir does not exist yet — skip preprocessing", project_name)
+        return {"success": True, "processed": 0, "error": None}
 
     # Only pass supported image extensions to exiftool
     ext_args: list[str] = []

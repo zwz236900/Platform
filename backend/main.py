@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import shutil
 import time
@@ -28,6 +30,13 @@ from modules.models import (
     PipelineConfig,
     PipelineStep,
     TaskStatus,
+)
+from modules.sam_runner import (
+    build_sam_command,
+    get_sam_process,
+    is_sam_running,
+    remove_sam_process,
+    run_sam_async,
 )
 from modules.task_manager import (
     _input_image_dir,
@@ -272,7 +281,7 @@ async def upload_images(
             dest.write_bytes(content)
 
     # Strip IPTC/EXIF metadata to prevent OpenImageIO crash during undistortion
-    prep_result = preprocess_images(project_name)
+    prep_result = await asyncio.to_thread(preprocess_images, project_name)
     logger.info("Project %r: metadata preprocessing — success=%s, processed=%s",
                 project_name, prep_result.get("success"), prep_result.get("processed"))
 
@@ -332,7 +341,7 @@ async def run_pipeline(
 
     update_project(project_name, config=config.model_dump())
     logger.info("Project %r: config updated, starting pipeline", project_name)
-    _start_pipeline(project_name)
+    await asyncio.to_thread(_start_pipeline, project_name)
 
     return {"success": True, "message": f"Pipeline started for {project_name}"}
 
@@ -365,6 +374,140 @@ async def download_file(project_name: str, filename: str):
 
     return FileResponse(file_path, filename=Path(filename).name,
                         media_type="application/octet-stream")
+
+
+# ---------------------------------------------------------------------------
+# Helpers — SAM
+# ---------------------------------------------------------------------------
+
+SAM_RESULT_MANIFEST = "manifest.json"
+
+
+def _check_sam_completion(project_name: str) -> None:
+    """If the SAM process for project has exited, update status."""
+    proc = get_sam_process(project_name)
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        if proc.returncode == 0:
+            logger.info("Project %r SAM finished successfully", project_name)
+        else:
+            logger.error("Project %r SAM FAILED (exit code %s)", project_name, proc.returncode)
+        remove_sam_process(project_name)
+
+
+# ---------------------------------------------------------------------------
+# API Routes — SAM
+# ---------------------------------------------------------------------------
+
+@app.post("/api/projects/{project_name}/sam/run")
+async def run_sam(
+    project_name: str,
+    prompts: str = Form(default="object"),
+    confidence: float = Form(default=0.5),
+    save_masks: bool = Form(default=True),
+    no_vis: bool = Form(default=True),
+    device: str = Form(default="cuda"),
+):
+    """Run SAM3 inference on a project's input images.
+
+    Args:
+        prompts: Comma-separated text prompts (e.g. "car,person,dog").
+        confidence: Detection confidence threshold (0.0–1.0).
+        save_masks: Export each mask as a standalone PNG.
+        no_vis: Skip visualization images (faster).
+        device: "cuda" or "cpu".
+    """
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+    if is_sam_running(project_name):
+        raise HTTPException(400, "SAM inference is already running")
+
+    prompt_list = [s.strip() for s in prompts.split(",") if s.strip()]
+    if not prompt_list:
+        raise HTTPException(400, "At least one prompt is required")
+
+    cmd = build_sam_command(
+        project_name,
+        prompts=prompt_list,
+        confidence=confidence,
+        device=device,
+        save_masks=save_masks,
+        no_vis=no_vis,
+    )
+
+    logger.info("Project %r starting SAM: prompts=%s", project_name, prompt_list)
+    await asyncio.to_thread(run_sam_async, project_name, cmd)
+
+    return {
+        "success": True,
+        "message": f"SAM inference started for {project_name}",
+        "data": {
+            "prompts": prompt_list,
+            "confidence": confidence,
+            "save_masks": save_masks,
+        },
+    }
+
+
+@app.get("/api/projects/{project_name}/sam/result")
+async def get_sam_result(project_name: str):
+    """Get SAM inference results (manifest.json content)."""
+    _check_sam_completion(project_name)
+
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    manifest_path = _sfm_output_dir(project_name).parent / "SAM_output" / SAM_RESULT_MANIFEST
+
+    if not manifest_path.exists():
+        return {
+            "project_name": project_name,
+            "ready": False,
+            "message": "No SAM results yet. Run SAM inference first.",
+            "results": [],
+        }
+
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {
+            "project_name": project_name,
+            "ready": False,
+            "message": "Failed to parse SAM results.",
+            "results": [],
+        }
+
+    return {
+        "project_name": project_name,
+        "ready": True,
+        "total_images": data.get("total_images", 0),
+        "total_prompts": data.get("total_prompts", 0),
+        "results": data.get("results", []),
+    }
+
+
+@app.get("/api/projects/{project_name}/sam/log")
+async def get_sam_log(project_name: str, lines: int = 100):
+    """Get SAM inference log."""
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    log_path = _sfm_output_dir(project_name).parent / "SAM_output" / "sam.log"
+
+    if not log_path.exists():
+        return {"project_name": project_name, "log": "(no log yet)"}
+
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+        return {"project_name": project_name, "log": "".join(all_lines[-lines:])}
+    except OSError:
+        return {"project_name": project_name, "log": "(error reading log)"}
 
 
 # ---------------------------------------------------------------------------
