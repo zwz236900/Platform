@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SFM 三维重建平台</title>
+<style>
+:root {
+  --bg: #f0f2f5; --panel: #fff; --border: #e5e7eb; --text: #1f2937; --muted: #9ca3af;
+  --primary: #4f46e5; --primary-hover: #4338ca; --green: #16a34a;
+  --red: #dc2626; --amber: #d97706; --radius: 10px;
+  --shadow: 0 1px 3px rgba(0,0,0,.08);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: var(--bg); color: var(--text); height: 100vh; display: flex; }
+a { color: var(--primary); text-decoration: none; }
+
+/* ── 侧栏 ── */
+.sidebar { width: 280px; min-width: 280px; background: var(--panel); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; box-shadow: var(--shadow); z-index: 10; }
+.sidebar-header { padding: 20px 16px; border-bottom: 1px solid var(--border);
+  display: flex; justify-content: space-between; align-items: center; }
+.sidebar-header .logo { font-size: 18px; font-weight: 800; color: var(--primary); letter-spacing: -.3px; }
+.btn-new { background: var(--primary); color: #fff; border: none; padding: 7px 16px;
+  border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600; white-space: nowrap; }
+.btn-new:hover { background: var(--primary-hover); }
+.project-list { flex: 1; overflow-y: auto; padding: 8px; }
+.project-item { padding: 14px; border-radius: var(--radius); cursor: pointer; margin-bottom: 2px;
+  border: 2px solid transparent; transition: all .15s; }
+.project-item:hover { background: #eef2ff; }
+.project-item.active { background: #e0e7ff; border-color: var(--primary); }
+.project-item .pname { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
+.project-item .pmeta { font-size: 12px; color: var(--muted); display: flex; gap: 10px; align-items: center; }
+.tag { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+.tag-pending  { background: #fef3c7; color: #92400e; }
+.tag-running  { background: #dbeafe; color: #1e40af; }
+.tag-completed{ background: #dcfce7; color: #166534; }
+.tag-failed   { background: #fee2e2; color: #991b1b; }
+
+/* ── 主区域 ── */
+.main { flex: 1; overflow-y: auto; }
+.main-inner { max-width: 880px; margin: 0 auto; padding: 28px 24px; }
+
+/* ── 卡片 ── */
+.card { background: var(--panel); border-radius: var(--radius); box-shadow: var(--shadow);
+  border: 1px solid var(--border); padding: 24px; margin-bottom: 20px; }
+.card h2 { font-size: 15px; margin-bottom: 18px; padding-bottom: 10px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 8px; }
+.card h2 .icon { font-size: 18px; }
+
+/* ── 表单 ── */
+.field { margin-bottom: 16px; }
+.field label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 5px; color: #6b7280; }
+.field input, .field select { width: 100%; padding: 9px 12px; border: 1px solid var(--border);
+  border-radius: 7px; font-size: 14px; font-family: inherit; background: #fafafa; transition: border-color .15s; }
+.field input:focus, .field select:focus { outline: none; border-color: var(--primary); background: #fff; }
+.row { display: flex; gap: 16px; }
+.row .field { flex: 1; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chips label { display: flex; align-items: center; gap: 5px; font-size: 13px; font-weight: 500;
+  padding: 5px 12px; border-radius: 16px; cursor: pointer; background: #f3f4f6; user-select: none; }
+.chips label:has(input:checked) { background: #e0e7ff; color: var(--primary); }
+.chips input[type=checkbox] { width: auto; accent-color: var(--primary); }
+
+/* ── 拖拽区 ── */
+.drop-zone { display: block; border: 2px dashed #d1d5db; border-radius: var(--radius); padding: 40px 20px;
+  text-align: center; cursor: pointer; transition: all .2s; background: #fafafa; }
+.drop-zone:hover, .drop-zone.dragover { border-color: var(--primary); background: #eef2ff; }
+.drop-zone .dz-icon { font-size: 40px; margin-bottom: 8px; pointer-events: none; }
+.drop-zone p { color: var(--muted); font-size: 13px; pointer-events: none; }
+.file-chips { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 4px; }
+.file-chips span { font-size: 12px; background: #e0e7ff; color: var(--primary);
+  padding: 3px 10px; border-radius: 12px; display: inline-flex; align-items: center; gap: 4px; }
+.file-chips span a { color: var(--red); font-weight: 700; margin-left: 2px; cursor: pointer; }
+
+/* ── 按钮 ── */
+.btn { padding: 9px 18px; border: none; border-radius: 7px; cursor: pointer;
+  font-size: 13px; font-weight: 600; display: inline-flex; align-items: center; gap: 5px;
+  transition: all .15s; font-family: inherit; }
+.btn-primary { background: var(--primary); color: #fff; }
+.btn-primary:hover { background: var(--primary-hover); }
+.btn-danger { background: #fff; color: var(--red); border: 1px solid #fecaca; }
+.btn-danger:hover { background: #fef2f2; }
+.btn-ghost { background: #fff; color: var(--text); border: 1px solid var(--border); }
+.btn-ghost:hover { background: #f9fafb; }
+.btn-sm { padding: 5px 12px; font-size: 12px; }
+.btn:disabled { opacity: .5; pointer-events: none; }
+.btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 20px; }
+
+/* ── 进度条 ── */
+.progress { height: 6px; background: #e5e7eb; border-radius: 3px; overflow: hidden; margin: 12px 0; }
+.progress .bar { height: 100%; background: var(--primary); border-radius: 3px;
+  width: 30%; animation: slide 1.6s infinite ease-in-out; }
+@keyframes slide { 0% { transform: translateX(-100%); } 100% { transform: translateX(430%); } }
+
+/* ── 表格 ── */
+.kv { width: 100%; border-collapse: collapse; font-size: 13px; }
+.kv td { padding: 7px 10px; border-bottom: 1px solid #f3f4f6; }
+.kv td:first-child { font-weight: 600; color: var(--muted); width: 130px; font-size: 12px; }
+
+/* ── 步骤指示器 ── */
+.steps-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 14px; }
+.step-chip { padding: 5px 12px; border-radius: 14px; font-size: 12px; font-weight: 500; background: #f3f4f6; color: var(--muted); }
+.step-chip.done { background: #dcfce7; color: #166534; }
+.step-chip.current { background: #dbeafe; color: #1e40af; animation: pulse 1.2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.6} }
+
+/* ── 日志 ── */
+.log-box { background: #1e1e1e; color: #d4d4d4; font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace;
+  font-size: 12px; padding: 14px; border-radius: 8px; max-height: 380px;
+  overflow-y: auto; white-space: pre-wrap; word-break: break-all; line-height: 1.6; }
+
+/* ── 下载链接 ── */
+.dl-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.dl-list a { display: inline-flex; align-items: center; gap: 4px;
+  padding: 7px 14px; background: #eef2ff; border-radius: 7px; font-size: 13px; font-weight: 500; }
+.dl-list a:hover { background: #e0e7ff; }
+
+/* ── 空状态 ── */
+.empty { text-align: center; padding: 50px 20px; color: var(--muted); }
+.empty .icon { font-size: 48px; margin-bottom: 10px; }
+
+/* ── 项目头部 ── */
+.project-head { display: flex; justify-content: space-between; align-items: flex-start; }
+.project-head h1 { font-size: 22px; font-weight: 700; }
+.project-head .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+<!-- ════════════════ 侧栏 ════════════════ -->
+<aside class="sidebar">
+  <div class="sidebar-header">
+    <span class="logo">📷 SFM</span>
+    <button type="button" class="btn-new" onclick="showCreate()">+ 新建项目</button>
+  </div>
+  <nav class="project-list" id="projectList">
+    <div class="empty"><div class="icon">📭</div><p>暂无项目</p></div>
+  </nav>
+</aside>
+
+<!-- ════════════════ 主区域 ════════════════ -->
+<main class="main" id="mainContent">
+
+  <!-- 新建项目 -->
+  <div id="viewCreate" class="main-inner">
+    <div class="card">
+      <h2><span class="icon">🆕</span> 新建项目</h2>
+      <div class="field">
+        <label>项目名称</label>
+        <input type="text" id="newProjectName" placeholder="例如：校园重建、展厅扫描">
+      </div>
+      <div class="field">
+        <label>上传图片（可选，也可创建后再传）</label>
+        <label class="drop-zone" id="createDropZone">
+          <div class="dz-icon">📁</div>
+          <p>拖拽图片或 .zip 文件到此处，或点击选择</p>
+        </label>
+        <input type="file" id="createFileInput" multiple style="display:none"
+               accept=".jpg,.jpeg,.png,.tif,.tiff,.bmp,.pgm,.ppm,.zip">
+        <div class="file-chips" id="createFileList"></div>
+      </div>
+      <div class="btn-row">
+        <button type="button" class="btn btn-primary" id="createBtn" onclick="doCreate()">创建项目</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 项目详情 -->
+  <div id="viewProject" class="main-inner" style="display:none"></div>
+</main>
+
+<!-- ════════════════ 脚本 ════════════════ -->
+<script>
+// ── 全局状态 ──
+let curProject = null;
+let createFiles = [];    // 新建页面的待上传文件
+let uploadFiles = [];    // 项目详情上传面板的待上传文件
+let _refreshTimer = null; // 自动刷新定时器句柄，防止堆积
+
+// ── 快捷查找 ──
+const $ = id => document.getElementById(id);
+
+// ── 工具函数 ──
+function esc(s)  { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function escQ(s) { return String(s).replace(/'/g,"\\'").replace(/"/g,'&quot;'); }
+function fmtTime(s) { return s ? new Date(s).toLocaleString('zh-CN') : '-'; }
+
+// ── API ──
+const api = {
+  async call(method, url, body) {
+    const opts = { method };
+    if (body) opts.body = body;
+    const r = await fetch(url, opts);
+    if (!r.ok) { const e = await r.json().catch(()=>({})); throw new Error(e.detail || `${r.status}`); }
+    return r.json();
+  },
+  createProject(name) {
+    const f = new FormData(); f.append('name', name);
+    return this.call('POST', '/api/projects', f);
+  },
+  listProjects()  { return this.call('GET', '/api/projects'); },
+  getProject(name) { return this.call('GET', `/api/projects/${encodeURIComponent(name)}`); },
+  deleteProject(name) { return this.call('DELETE', `/api/projects/${encodeURIComponent(name)}`); },
+  uploadImages(name, files) {
+    const f = new FormData();
+    files.forEach(x => f.append('images', x));
+    return this.call('POST', `/api/projects/${encodeURIComponent(name)}/images`, f);
+  },
+  runPipeline(name, config) {
+    const f = new FormData();
+    for (const [k,v] of Object.entries(config)) f.append(k, v);
+    return this.call('POST', `/api/projects/${encodeURIComponent(name)}/run`, f);
+  },
+  getLog(name) { return this.call('GET', `/api/projects/${encodeURIComponent(name)}/log`); },
+};
+
+// ── 拖拽区绑定 ──
+// 用 <label> 的 for 属性关联隐藏的 <input type="file">，点击由浏览器原生行为触发文件选择器
+// JavaScript 只处理拖拽事件
+function bindDropZone(labelId, inputId, listId, filesArr) {
+  const label = $(labelId);
+  const inp   = $(inputId);
+  const list  = $(listId);
+  if (!label || !inp) return;
+
+  // 让 label 的 for 属性指向 input
+  label.setAttribute('for', inputId);
+
+  // 拖拽：文件放入 filesArr
+  label.addEventListener('dragover', e => { e.preventDefault(); label.classList.add('dragover'); });
+  label.addEventListener('dragleave', () => { label.classList.remove('dragover'); });
+  label.addEventListener('drop', e => {
+    e.preventDefault();
+    label.classList.remove('dragover');
+    appendFiles(e.dataTransfer.files, filesArr, list);
+  });
+
+  // input 变化时也追加文件（点击选择或拖拽后浏览器写入 input.files）
+  inp.addEventListener('change', () => {
+    appendFiles(inp.files, filesArr, list);
+    inp.value = '';  // 清空以便重复选择同名文件
+  });
+}
+
+function appendFiles(fileList, arr, listEl) {
+  for (const f of fileList) {
+    if (!arr.find(x => x.name === f.name && x.size === f.size && x.lastModified === f.lastModified)) {
+      arr.push(f);
+    }
+  }
+  renderFileChips(arr, listEl);
+}
+
+function renderFileChips(arr, listEl) {
+  if (!listEl) return;
+  listEl.innerHTML = arr.map((f, i) =>
+    `<span>${esc(f.name)} <a href="#" data-idx="${i}">×</a></span>`
+  ).join('');
+}
+
+// 文件 chip 删除 — 事件委托
+document.addEventListener('click', function(e) {
+  const a = e.target.closest('.file-chips a[data-idx]');
+  if (!a) return;
+  e.preventDefault();
+  const idx = parseInt(a.getAttribute('data-idx'));
+  const listEl = a.closest('.file-chips');
+  let arr;
+  if (listEl.id === 'createFileList')  arr = createFiles;
+  else if (listEl.id === 'uploadFileList') arr = uploadFiles;
+  else return;
+  if (idx >= 0 && idx < arr.length) arr.splice(idx, 1);
+  renderFileChips(arr, listEl);
+});
+
+// ── 视图切换 ──
+function showCreate() {
+  curProject = null;
+  $('viewCreate').style.display = 'block';
+  $('viewProject').style.display = 'none';
+  document.querySelectorAll('.project-item').forEach(el => el.classList.remove('active'));
+}
+
+async function showProject(name) {
+  curProject = name;
+  $('viewCreate').style.display = 'none';
+  $('viewProject').style.display = 'block';
+  document.querySelectorAll('.project-item').forEach(el => el.classList.remove('active'));
+  const el = document.querySelector(`[data-project="${escQ(name)}"]`);
+  if (el) el.classList.add('active');
+  await renderProject(name);
+}
+
+// ── 创建项目 ──
+async function doCreate() {
+  const name = $('newProjectName').value.trim();
+  if (!name) { alert('请输入项目名称'); return; }
+  const btn = $('createBtn');
+  btn.disabled = true; btn.textContent = '创建中...';
+  try {
+    const r = await api.createProject(name);
+    const pn = r.data.project_name;
+    if (createFiles.length) {
+      await api.uploadImages(pn, createFiles);
+      createFiles = [];
+      renderFileChips(createFiles, $('createFileList'));
+    }
+    $('newProjectName').value = '';
+    await refreshSidebar();
+    showProject(pn);
+  } catch(e) { alert('创建失败：' + e.message); }
+  btn.disabled = false; btn.textContent = '创建项目';
+}
+
+// ── 渲染项目详情 ──
+async function renderProject(name) {
+  const c = $('viewProject');
+  c.innerHTML = '<div class="card" style="text-align:center;padding:40px">加载中...</div>';
+  try {
+    const p = await api.getProject(name);
+    const tagCls = 'tag-' + p.status;
+    const stepsReq  = p.config?.steps || [];
+    const stepsDone = p.pipeline?.steps_completed || [];
+
+    // 下载文件列表
+    let files = [];
+    if (p.pipeline?.steps_completed?.length) {
+      files.push({n:'pipeline_result.json', p:'pipeline_result.json'});
+      files.push({n:'database.db', p:'database.db'});
+    }
+    if (p.pipeline) {
+      files.push({n:'sparse/0/cameras.bin', p:'sparse/0/cameras.bin'});
+      files.push({n:'sparse/0/images.bin', p:'sparse/0/images.bin'});
+      files.push({n:'sparse/0/points3D.bin', p:'sparse/0/points3D.bin'});
+    }
+    if (p.steps?.mvs?.status === 'ok') files.push({n:'fused.ply', p:'dense/fused.ply'});
+
+    const dl = (pn, path) => `/api/projects/${encodeURIComponent(pn)}/download/${encodeURIComponent(path)}`;
+    const statusLabels = {pending:'待处理', running:'运行中', completed:'已完成', failed:'失败'};
+    const stepLabels = {extract:'特征提取', match:'特征匹配', sfm:'稀疏重建', undistort:'图像去畸变', mvs:'稠密重建', fusion:'点云融合'};
+
+    let html = `
+    <div class="card">
+      <div class="project-head">
+        <div>
+          <h1>${esc(p.name)}</h1>
+          <div class="sub">${esc(p.project_name)} · ${p.num_images} 张图片</div>
+        </div>
+        <span class="tag ${tagCls}" style="font-size:14px;padding:4px 14px">${statusLabels[p.status]||p.status}</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2><span class="icon">📊</span> 运行状态</h2>
+      ${p.status==='running' ? '<div class="progress"><div class="bar"></div></div>' : ''}
+      <table class="kv">
+        <tr><td>状态</td><td><span class="tag ${tagCls}">${statusLabels[p.status]}</span></td></tr>
+        <tr><td>图片数量</td><td>${p.num_images}</td></tr>
+        <tr><td>创建时间</td><td>${fmtTime(p.created_at)}</td></tr>
+        ${p.started_at  ? `<tr><td>开始时间</td><td>${fmtTime(p.started_at)}</td></tr>` : ''}
+        ${p.finished_at ? `<tr><td>完成时间</td><td>${fmtTime(p.finished_at)}</td></tr>` : ''}
+        ${p.pipeline?.elapsed_seconds ? `<tr><td>总耗时</td><td>${Math.round(p.pipeline.elapsed_seconds)} 秒</td></tr>` : ''}
+        ${p.error_message ? `<tr><td>错误信息</td><td style="color:var(--red)">${esc(p.error_message)}</td></tr>` : ''}
+      </table>
+      ${stepsReq.length ? `
+      <div class="steps-row">
+        ${stepsReq.map(s => {
+          const done = stepsDone.includes(s);
+          const cur  = !done && p.status==='running' && stepsReq[stepsDone.length]===s;
+          const cls  = done ? 'done' : (cur ? 'current' : '');
+          return `<span class="step-chip ${cls}">${done?'✅':(cur?'🔄':'⏳')} ${stepLabels[s]||s}</span>`;
+        }).join('')}
+      </div>` : ''}
+    </div>
+
+    <div class="card">
+      <h2><span class="icon">🔧</span> 操作</h2>
+      <div class="btn-row" style="margin-top:0">
+        <button type="button" class="btn btn-primary" onclick="showRunPanel()">▶ 运行重建</button>
+        <button type="button" class="btn btn-ghost" onclick="showUploadPanel()">📤 上传图片</button>
+        ${p.status!=='running' ? `<button type="button" class="btn btn-danger" onclick="doDelete('${escQ(p.project_name)}')">🗑 删除项目</button>` : ''}
+        <button type="button" class="btn btn-ghost" onclick="renderProject(curProject)">🔄 刷新</button>
+      </div>
+    </div>
+
+    <div class="card" id="runPanel" style="display:none">
+      <h2><span class="icon">⚙️</span> 运行配置</h2>
+      <div class="row">
+        <div class="field"><label>匹配策略</label>
+          <select id="run_matcher"><option value="exhaustive">穷举匹配 exhaustive</option><option value="sequential">顺序匹配 sequential</option><option value="vocab_tree">词汇树 vocab_tree</option><option value="spatial">空间匹配 spatial</option></select></div>
+        <div class="field"><label>相机模型</label>
+          <select id="run_camera"><option value="SIMPLE_RADIAL">SIMPLE_RADIAL</option><option value="PINHOLE">PINHOLE</option><option value="SIMPLE_PINHOLE">SIMPLE_PINHOLE</option><option value="RADIAL">RADIAL</option><option value="OPENCV">OPENCV</option></select></div>
+      </div>
+      <div class="field"><label>重建步骤</label>
+        <div class="chips">
+          <label><input type="checkbox" id="run_s_extract" checked> 特征提取</label>
+          <label><input type="checkbox" id="run_s_match" checked> 特征匹配</label>
+          <label><input type="checkbox" id="run_s_sfm" checked> 稀疏重建</label>
+          <label><input type="checkbox" id="run_s_undistort" checked> 图像去畸变</label>
+          <label><input type="checkbox" id="run_s_mvs" checked> 稠密重建</label>
+        </div></div>
+      <div class="row">
+        <div class="field"><label>共享相机内参</label><select id="run_single"><option value="true">是</option><option value="false">否</option></select></div>
+        <div class="field"><label>GPU 加速</label><select id="run_gpu"><option value="true">是</option><option value="false">否（CPU）</option></select></div>
+        <div class="field"><label>GPU 编号</label><input type="number" id="run_gpu_idx" value="0" min="0"></div>
+      </div>
+      <div class="row">
+        <div class="field"><label>最大特征点数</label><input type="number" id="run_features" value="8192" min="1"></div>
+        <div class="field" style="align-self:end"><label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:400">
+          <input type="checkbox" id="run_nogeo" style="width:auto"> 禁用几何一致性</label></div>
+      </div>
+      <div class="btn-row">
+        <button type="button" class="btn btn-primary" id="runBtn" onclick="doRun()">启动重建</button>
+        <button type="button" class="btn btn-ghost" onclick="$('runPanel').style.display='none'">取消</button>
+      </div>
+    </div>
+
+    <div class="card" id="uploadPanel" style="display:none">
+      <h2><span class="icon">📤</span> 上传图片</h2>
+      <label class="drop-zone" id="uploadDropZone">
+        <div class="dz-icon">📁</div>
+        <p>拖拽图片或 .zip 文件到此处，或点击选择</p>
+      </label>
+      <input type="file" id="uploadFileInput" multiple style="display:none"
+             accept=".jpg,.jpeg,.png,.tif,.tiff,.bmp,.pgm,.ppm,.zip">
+      <div class="file-chips" id="uploadFileList"></div>
+      <div class="btn-row">
+        <button type="button" class="btn btn-primary" id="uploadBtn" onclick="doUpload()">开始上传</button>
+        <button type="button" class="btn btn-ghost" onclick="$('uploadPanel').style.display='none'">取消</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2><span class="icon">📥</span> 结果下载</h2>
+      <div class="dl-list">
+        ${files.length ? files.map(f => `<a href="${dl(p.project_name,f.p)}" download>📥 ${f.n}</a>`).join('') : '<span style="color:var(--muted);font-size:13px">暂无结果，请先运行重建</span>'}
+      </div>
+    </div>`;
+
+    if (p.log_tail) {
+      html += `
+    <div class="card">
+      <h2><span class="icon">📋</span> 运行日志</h2>
+      <div class="log-box">${esc(p.log_tail)}</div>
+      <div class="btn-row">
+        <button type="button" class="btn btn-ghost btn-sm" onclick="refreshLog('${escQ(p.project_name)}')">🔄 刷新</button>
+        <a href="/api/projects/${encodeURIComponent(p.project_name)}/log" target="_blank" class="btn btn-ghost btn-sm">📄 完整日志</a>
+      </div>
+    </div>`;
+    }
+
+    c.innerHTML = html;
+
+    // 绑定项目详情页的上传拖拽区（每次重新渲染都需重新绑定）
+    uploadFiles = [];
+    bindDropZone('uploadDropZone', 'uploadFileInput', 'uploadFileList', uploadFiles);
+    window._curP = p.project_name;
+
+    // 运行中自动刷新（清除旧定时器，防止堆积）
+    if (_refreshTimer) { clearTimeout(_refreshTimer); _refreshTimer = null; }
+    if (p.status === 'running' || p.status === 'pending') {
+      if ($('runPanel').style.display !== 'block' && $('uploadPanel').style.display !== 'block') {
+        _refreshTimer = setTimeout(() => { if (curProject === name) renderProject(name); }, 3000);
+      }
+    }
+
+  } catch(e) {
+    c.innerHTML = `<div class="card"><p style="color:var(--red)">加载失败：${esc(e.message)}</p></div>`;
+  }
+}
+
+// ── 操作函数 ──
+function showRunPanel()   { const p=$('runPanel'); p.style.display='block'; p.scrollIntoView({behavior:'smooth'}); }
+function showUploadPanel() { const p=$('uploadPanel'); p.style.display='block'; p.scrollIntoView({behavior:'smooth'}); }
+
+async function doRun() {
+  const btn = $('runBtn');
+  btn.disabled = true; btn.textContent = '启动中...';
+  const steps = ['extract','match','sfm','undistort','mvs'].filter(s => $('run_s_'+s)?.checked);
+  const config = {
+    steps: steps.join(','), matcher: $('run_matcher').value, camera_model: $('run_camera').value,
+    single_camera: $('run_single').value, use_gpu: $('run_gpu').value,
+    gpu_index: $('run_gpu_idx').value, max_num_features: $('run_features').value,
+    no_geom_consistency: $('run_nogeo').checked,
+  };
+  try {
+    await api.runPipeline(window._curP, config);
+    $('runPanel').style.display = 'none';
+    await renderProject(window._curP);
+  } catch(e) { alert('启动失败：'+e.message); }
+  btn.disabled = false; btn.textContent = '启动重建';
+}
+
+async function doUpload() {
+  if (!uploadFiles.length) { alert('请先选择文件'); return; }
+  const btn = $('uploadBtn');
+  btn.disabled = true; btn.textContent = '上传中...';
+  try {
+    await api.uploadImages(window._curP, uploadFiles);
+    uploadFiles = [];
+    renderFileChips(uploadFiles, $('uploadFileList'));
+    $('uploadPanel').style.display = 'none';
+    await renderProject(window._curP);
+  } catch(e) { alert('上传失败：'+e.message); }
+  btn.disabled = false; btn.textContent = '开始上传';
+}
+
+async function doDelete(name) {
+  if (!confirm(`确定删除项目「${name}」及其所有数据？此操作不可恢复。`)) return;
+  try {
+    await api.deleteProject(name);
+    curProject = null;
+    await refreshSidebar();
+    showCreate();
+  } catch(e) { alert('删除失败：'+e.message); }
+}
+
+async function refreshLog(name) {
+  try {
+    const main = document.querySelector('.main');
+    const box  = document.querySelector('.log-box');
+    const mainScroll = main ? main.scrollTop : 0;
+    const boxScroll  = box  ? box.scrollTop  : 0;
+    const d = await api.getLog(name);
+    if (box) { box.textContent = d.log; box.scrollTop = boxScroll; }
+    if (main) main.scrollTop = mainScroll;
+  } catch(e) { console.error(e); }
+}
+
+// ── 侧栏刷新 ──
+let _sidebarHash = '';
+async function refreshSidebar() {
+  try {
+    const data = await api.listProjects();
+    const list = $('projectList');
+    const statusLabels = {pending:'待处理', running:'运行中', completed:'已完成', failed:'失败'};
+    if (!data.projects.length) {
+      if (_sidebarHash !== '__empty__') {
+        _sidebarHash = '__empty__';
+        list.innerHTML = '<div class="empty"><div class="icon">📭</div><p>暂无项目</p></div>';
+      }
+    } else {
+      const html = data.projects.map(p => `
+        <div class="project-item${p.project_name===curProject?' active':''}" data-project="${escQ(p.project_name)}"
+             onclick="showProject('${escQ(p.project_name)}')">
+          <div class="pname">${esc(p.name)}</div>
+          <div class="pmeta">
+            <span class="tag tag-${p.status}">${statusLabels[p.status]}</span>
+            <span>${p.num_images} 张</span>
+            ${p.elapsed_seconds ? `<span>${p.elapsed_seconds}s</span>` : ''}
+          </div>
+        </div>`).join('');
+      if (html !== _sidebarHash) {
+        _sidebarHash = html;
+        list.innerHTML = html;
+      }
+    }
+  } catch(e) { console.error(e); }
+}
+
+// ── 初始化 ──
+bindDropZone('createDropZone', 'createFileInput', 'createFileList', createFiles);
+refreshSidebar();
+setInterval(refreshSidebar, 5000);
+</script>
+</body>
+</html>
