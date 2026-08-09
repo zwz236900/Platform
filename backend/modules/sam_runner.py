@@ -33,7 +33,9 @@ def build_sam_command(
     confidence: float = 0.5,
     device: str = "cuda",
     save_masks: bool = True,
-    no_vis: bool = True,
+    save_masks_rle: bool = False,
+    vis: bool = False,
+    batch_size: int = 1,
     checkpoint: str = "/workspace/model/sam3.pt",
 ) -> list[str]:
     """Build the docker exec command to run SAM_CLI.py inside the sam3 container.
@@ -46,20 +48,23 @@ def build_sam_command(
     output_dir = DATA_DIR_CONTAINER / project_name / "SAM_output"
 
     cmd = [
-        "docker", "exec", CONTAINER_NAME,
+        "docker", "exec", "-e", "PYTHONUNBUFFERED=1", CONTAINER_NAME,
         "python3", SAM_CLI_PATH,
         "--input-dir", str(image_dir),
         "--prompts", *prompts,
         "-o", str(output_dir),
         "--device", device,
         "--confidence", str(confidence),
+        "--batch-size", str(batch_size),
         "--checkpoint", checkpoint,
     ]
 
     if save_masks:
         cmd.append("--save-masks")
-    if no_vis:
-        cmd.append("--no-vis")
+    if save_masks_rle:
+        cmd.append("--save-masks-rle")
+    if vis:
+        cmd.append("--vis")
 
     return cmd
 

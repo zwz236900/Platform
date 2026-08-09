@@ -419,7 +419,9 @@ async def run_sam(
     prompts: str = Form(default="object"),
     confidence: float = Form(default=0.5),
     save_masks: bool = Form(default=True),
-    no_vis: bool = Form(default=True),
+    save_masks_rle: bool = Form(default=False),
+    vis: bool = Form(default=False),
+    batch_size: int = Form(default=1),
     device: str = Form(default="cuda"),
 ):
     """Run SAM3 inference on a project's input images.
@@ -428,7 +430,9 @@ async def run_sam(
         prompts: Comma-separated text prompts (e.g. "car,person,dog").
         confidence: Detection confidence threshold (0.0–1.0).
         save_masks: Export each mask as a standalone PNG.
-        no_vis: Skip visualization images (faster).
+        save_masks_rle: Include RLE-encoded masks in the JSON output.
+        vis: Generate matplotlib visualizations during inference (memory-heavy, off by default).
+        batch_size: Number of images to batch through the backbone (reduces GPU idle time).
         device: "cuda" or "cpu".
     """
     p = get_project(project_name)
@@ -447,7 +451,9 @@ async def run_sam(
         confidence=confidence,
         device=device,
         save_masks=save_masks,
-        no_vis=no_vis,
+        save_masks_rle=save_masks_rle,
+        vis=vis,
+        batch_size=batch_size,
     )
 
     logger.info("Project %r starting SAM: prompts=%s", project_name, prompt_list)
