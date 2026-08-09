@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 
 from modules.docker_logger import LOG_DIR as DOCKER_LOG_DIR, start_follow
-from modules.docker_runner import is_container_running
+from modules.image_preprocessor import is_container_running
 from modules.logger import get_logger
 
 logger = get_logger(__name__)

@@ -20,7 +20,7 @@ logger = get_logger(__name__)
 DATA_DIR = Path("/home/zwz/Code/DATA")
 
 # Pre-created output directories (mirrors existing convention)
-OUTPUT_DIRS = ["SFM_output", "MVS_output", "3DGS_output", "PoinTR_output", "SAM_output"]
+OUTPUT_DIRS = ["SFM_output", "MVS_output", "3DGS_output", "PoinTR_output", "SAM_output", "algorithm_output"]
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +226,12 @@ def sync_project_from_result(project_name: str) -> None:
         updates["elapsed_seconds"] = result["pipeline"]["elapsed_seconds"]
 
     steps_completed = result.get("pipeline", {}).get("steps_completed", [])
-    steps_requested = result.get("pipeline", {}).get("steps_requested", [])
+    steps_requested_raw = result.get("pipeline", {}).get("steps_requested", [])
+    # Normalize: steps_requested may be a comma-separated string
+    if isinstance(steps_requested_raw, str):
+        steps_requested = [s.strip() for s in steps_requested_raw.split(",") if s.strip()]
+    else:
+        steps_requested = steps_requested_raw
     if steps_completed != steps_requested:
         updates["status"] = TaskStatus.FAILED.value
 

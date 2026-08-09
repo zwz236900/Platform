@@ -19,10 +19,12 @@ from modules.docker_runner import (
     build_sfm_command,
     get_process,
     is_process_running,
-    preprocess_images,
     remove_process,
     run_pipeline_async,
 )
+from modules.image_preprocessor import strip_metadata, undistort_images
+from algorithm.pointcloud_filter import run as run_pointcloud_filter
+from algorithm.image_mask import run as run_image_mask
 from modules.logger import get_logger, request_log
 from modules.models import (
     CameraModel,
@@ -39,6 +41,14 @@ from modules.mvs_runner import (
     is_mvs_running,
     remove_mvs_process,
     run_mvs_async,
+)
+from modules.gs_runner import (
+    GS_COMMANDS,
+    build_gs_command,
+    get_gs_process,
+    is_gs_running,
+    remove_gs_process,
+    run_gs_async,
 )
 from modules.sam_runner import (
     build_sam_command,
@@ -122,7 +132,7 @@ def _start_pipeline(project_name: str) -> None:
     steps = config_dict.get("steps", ["extract", "match", "sfm", "undistort", "mvs"])
 
     # Strip IPTC/EXIF metadata before pipeline to prevent OpenImageIO crash
-    prep_result = preprocess_images(project_name)
+    prep_result = strip_metadata(project_name)
     logger.info("Project %r: pre-run metadata check — success=%s, processed=%s",
                 project_name, prep_result.get("success"), prep_result.get("processed"))
 
@@ -292,7 +302,7 @@ async def upload_images(
             dest.write_bytes(content)
 
     # Strip IPTC/EXIF metadata to prevent OpenImageIO crash during undistortion
-    prep_result = await asyncio.to_thread(preprocess_images, project_name)
+    prep_result = await asyncio.to_thread(strip_metadata, project_name)
     logger.info("Project %r: metadata preprocessing — success=%s, processed=%s",
                 project_name, prep_result.get("success"), prep_result.get("processed"))
 
@@ -301,6 +311,119 @@ async def upload_images(
     logger.info("Project %r: uploaded images, now %d total", project_name, num)
 
     return {"success": True, "message": f"{num} images in project", "data": {"num_images": num}}
+
+
+# ---------------------------------------------------------------------------
+# API Routes — Image Preprocessing
+# ---------------------------------------------------------------------------
+
+@app.post("/api/projects/{project_name}/preprocess/undistort")
+async def undistort_project_images(project_name: str):
+    """Run COLMAP image_undistorter to remove lens distortion.
+
+    Requires that SfM has already completed (sparse/0 must exist).
+    Output: SFM_output/undistorted/ containing undistorted images (images/)
+    and a new sparse model with PINHOLE cameras (sparse/).
+    """
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+    if is_process_running(project_name):
+        raise HTTPException(400, "SfM pipeline is running — wait for it to finish")
+
+    # Check prerequisite: SfM sparse model must exist
+    sparse_dir = _sfm_output_dir(project_name) / "sparse" / "0"
+    if not sparse_dir.is_dir():
+        raise HTTPException(
+            400,
+            f"SfM sparse model not found at {sparse_dir}. Run the SfM pipeline first.",
+        )
+
+    logger.info("Project %r: starting image undistortion", project_name)
+    result = await asyncio.to_thread(undistort_images, project_name)
+
+    if not result.get("success"):
+        raise HTTPException(500, result.get("error", "Undistortion failed"))
+
+    return {
+        "success": True,
+        "message": f"Undistorted {result['num_images']} images",
+        "data": {
+            "output_dir": result["output_dir"],
+            "num_images": result["num_images"],
+        },
+    }
+
+
+@app.post("/api/projects/{project_name}/preprocess/mask-images")
+async def mask_project_images(
+    project_name: str,
+    prompt_slug: str = Form(default="object"),
+):
+    """Apply SAM masks to images, producing RGBA PNGs with transparent background.
+
+    Uses existing SAM masks in SAM_output/.
+    Output: algorithm_output/input_masked/
+    """
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    logger.info("Project %r: starting image masking (prompt=%s)", project_name, prompt_slug)
+    result = await asyncio.to_thread(run_image_mask, project_name, prompt_slug)
+
+    if not result.get("success"):
+        raise HTTPException(500, result.get("error", "Image masking failed"))
+
+    return {
+        "success": True,
+        "message": f"Masked {result['num_images']} images",
+        "data": {
+            "output_dir": result["output_dir"],
+            "num_images": result["num_images"],
+        },
+    }
+
+
+@app.post("/api/projects/{project_name}/preprocess/filter-pointcloud")
+async def filter_project_pointcloud(
+    project_name: str,
+    threshold: float = Form(default=0.3),
+    prompt_slug: str = Form(default="object"),
+):
+    """Filter MVS dense point cloud using multi-view SAM mask consistency.
+
+    Projects each 3D point into all camera views; keeps points that fall
+    inside SAM mask regions in most views.
+
+    Requires: MVS dense PLY + COLMAP sparse model + SAM masks.
+    Output: algorithm_output/filtered_scene.ply
+    """
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    if threshold < 0.0 or threshold > 1.0:
+        raise HTTPException(400, "threshold must be between 0.0 and 1.0")
+
+    logger.info("Project %r: starting pointcloud filter (threshold=%.2f, prompt=%s)",
+                project_name, threshold, prompt_slug)
+    result = await asyncio.to_thread(
+        run_pointcloud_filter, project_name, threshold, prompt_slug,
+    )
+
+    if not result.get("success"):
+        raise HTTPException(500, result.get("error", "Point cloud filtering failed"))
+
+    return {
+        "success": True,
+        "message": f"Kept {result['num_points_after']:,} / {result['num_points_before']:,} points",
+        "data": {
+            "output_path": result["output_path"],
+            "num_points_before": result["num_points_before"],
+            "num_points_after": result["num_points_after"],
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -691,6 +814,178 @@ async def download_mvs_file(project_name: str, filename: str):
         raise HTTPException(400, "Invalid filename")
 
     file_path = mvs_dir / safe_path
+    if not file_path.exists():
+        raise HTTPException(404, f"File not found: {filename}")
+
+    return FileResponse(file_path, filename=Path(filename).name,
+                        media_type="application/octet-stream")
+
+
+# ---------------------------------------------------------------------------
+# Helpers — 3DGS
+# ---------------------------------------------------------------------------
+
+def _gs_output_dir(project_name: str) -> Path:
+    return _sfm_output_dir(project_name).parent / "3DGS_output"
+
+
+def _check_gs_completion(project_name: str) -> None:
+    """If the 3DGS process for project has exited, update status."""
+    proc = get_gs_process(project_name)
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        if proc.returncode == 0:
+            logger.info("Project %r 3DGS finished successfully", project_name)
+        else:
+            logger.error("Project %r 3DGS FAILED (exit code %s)", project_name, proc.returncode)
+        remove_gs_process(project_name)
+
+
+# ---------------------------------------------------------------------------
+# API Routes — 3DGS
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/projects/{project_name}/3dgs/run")
+async def run_3dgs_pipeline(
+    project_name: str,
+    command: str = Form(default="full"),
+    iterations: int = Form(default=30_000),
+    resolution: int = Form(default=1),
+    white_background: bool = Form(default=False),
+    quiet: bool = Form(default=False),
+    checkpoint_interval: int = Form(default=0),
+    start_checkpoint: str = Form(default=""),
+):
+    """Run a 3D Gaussian Splatting pipeline step for a project.
+
+    Args:
+        command: "prepare", "train", "render", or "full" (prepare → train → render).
+        iterations: Training iterations (default 30000).
+        resolution: Image downscale factor (default 1 = full resolution).
+        white_background: Use white background instead of black.
+        quiet: Suppress non-essential output.
+        checkpoint_interval: Save checkpoint every N iterations (0 = default 7000/30000 only).
+        start_checkpoint: Path to .pth checkpoint to resume training from.
+    """
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+    if is_gs_running(project_name):
+        raise HTTPException(400, "3DGS pipeline is already running")
+
+    if command not in GS_COMMANDS:
+        raise HTTPException(400, f"Invalid 3DGS command: {command}. Choices: {GS_COMMANDS}")
+
+    # Verify prerequisites for train/render
+    if command in ("train", "full"):
+        sfm_sparse = _sfm_output_dir(project_name) / "sparse" / "0"
+        if not sfm_sparse.exists():
+            raise HTTPException(400, "SfM output not found. Run SfM pipeline first.")
+
+    cmd = build_gs_command(
+        project_name,
+        command=command,
+        iterations=iterations,
+        resolution=resolution,
+        white_background=white_background,
+        quiet=quiet,
+        checkpoint_interval=checkpoint_interval,
+        start_checkpoint=start_checkpoint or None,
+    )
+
+    logger.info("Project %r: starting 3DGS %s (iterations=%d, ckpt_interval=%d)",
+                project_name, command, iterations, checkpoint_interval)
+    await asyncio.to_thread(run_gs_async, project_name, cmd)
+
+    return {
+        "success": True,
+        "message": f"3DGS {command} started for {project_name}",
+        "data": {
+            "command": command,
+            "iterations": iterations,
+            "checkpoint_interval": checkpoint_interval,
+            "start_checkpoint": start_checkpoint or None,
+        },
+    }
+
+
+@app.get("/api/projects/{project_name}/3dgs/log")
+async def get_gs_log(project_name: str, lines: int = 100):
+    """Get 3DGS pipeline log."""
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    log_path = _gs_output_dir(project_name) / "gs_pipeline.log"
+    if not log_path.exists():
+        return {"project_name": project_name, "log": "(no log yet)"}
+
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+        return {"project_name": project_name, "log": "".join(all_lines[-lines:])}
+    except OSError:
+        return {"project_name": project_name, "log": "(error reading log)"}
+
+
+@app.get("/api/projects/{project_name}/3dgs/result")
+async def get_gs_result(project_name: str):
+    """Get 3DGS pipeline result — list of rendered images."""
+    _check_gs_completion(project_name)
+
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    output_dir = _gs_output_dir(project_name)
+
+    if not output_dir.exists():
+        return {
+            "project_name": project_name,
+            "ready": False,
+            "message": "No 3DGS results yet. Run 3DGS pipeline first.",
+        }
+
+    # Find the latest iteration directory
+    train_renders_dir = output_dir / "train"
+    renders = []
+    if train_renders_dir.exists():
+        for ours_dir in sorted(train_renders_dir.iterdir(), reverse=True):
+            if ours_dir.is_dir() and ours_dir.name.startswith("ours_"):
+                render_subdir = ours_dir / "renders"
+                if render_subdir.exists():
+                    renders = sorted([
+                        p.name for p in render_subdir.iterdir()
+                        if p.suffix.lower() == ".png"
+                    ])
+                break
+
+    has_point_cloud = (output_dir / "point_cloud").exists()
+
+    return {
+        "project_name": project_name,
+        "ready": True,
+        "renders_count": len(renders),
+        "renders": renders,
+        "has_point_cloud": has_point_cloud,
+    }
+
+
+@app.get("/api/projects/{project_name}/3dgs/download/{filename:path}")
+async def download_gs_file(project_name: str, filename: str):
+    """Download a result file from 3DGS_output directory."""
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    gs_dir = _gs_output_dir(project_name)
+    safe_path = os.path.normpath(filename)
+    if safe_path.startswith("..") or safe_path.startswith("/"):
+        raise HTTPException(400, "Invalid filename")
+
+    file_path = gs_dir / safe_path
     if not file_path.exists():
         raise HTTPException(404, f"File not found: {filename}")
 
