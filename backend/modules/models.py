@@ -91,7 +91,7 @@ class MVSConfig(BaseModel):
     mvs_type: MVSType = Field(default=MVSType.OPENMVS, description="MVS pipeline type")
     command: MVSCommand = Field(default=MVSCommand.PIPELINE)
     model: str = Field(default="0", description="SFM model name")
-    resolution_level: int = Field(default=1, ge=1, description="Downsample level")
+    resolution_level: int = Field(default=1, ge=0, description="Downsample level (0=full, 1=half, 2=quarter)")
     max_resolution: int = Field(default=3200, ge=1)
     min_resolution: int = Field(default=640, ge=1)
     number_views: int = Field(default=5, ge=1, description="Views for depth estimation")

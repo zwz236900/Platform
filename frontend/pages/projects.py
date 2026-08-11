@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import urlencode
 
 from PySide6.QtWidgets import (
@@ -19,9 +21,19 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QSizePolicy,
     QSplitter,
+    QFileDialog,
+    QProgressBar,
+    QApplication,
 )
-from PySide6.QtCore import Qt, Signal, QUrl, QTimer
-from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
+from PySide6.QtCore import Qt, Signal, QUrl, QTimer, QFile, QIODevice
+from PySide6.QtNetwork import (
+    QNetworkAccessManager,
+    QNetworkRequest,
+    QNetworkReply,
+    QHttpMultiPart,
+    QHttpPart,
+)
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont
 
 from .base_page import BasePage
 
@@ -74,6 +86,40 @@ class ApiClient(QWidget):
         """DELETE 请求。"""
         self._request("DELETE", path, tag=tag)
 
+    def upload_files(self, project_name: str, file_paths: list[str], tag: str = ""):
+        """上传文件到项目（multipart/form-data）。"""
+        multi_part = QHttpMultiPart(QHttpMultiPart.FormDataType)
+
+        for fp in file_paths:
+            file_part = QHttpPart()
+            filename = Path(fp).name
+            file_part.setHeader(
+                QNetworkRequest.ContentDispositionHeader,
+                f'form-data; name="images"; filename="{filename}"',
+            )
+            file_part.setHeader(
+                QNetworkRequest.ContentTypeHeader,
+                "application/octet-stream",
+            )
+            qfile = QFile(fp)
+            if not qfile.open(QIODevice.ReadOnly):
+                continue
+            qfile.setParent(multi_part)  # lifetime tied to multi_part
+            file_part.setBodyDevice(qfile)
+            multi_part.append(file_part)
+
+        path = f"/api/projects/{project_name}/images"
+        url = QUrl(API_BASE + path)
+        req = QNetworkRequest(url)
+
+        reply = self._mgr.post(req, multi_part)
+        multi_part.setParent(reply)  # auto-delete with reply
+
+        reply.setProperty("_tag", tag)
+        reply.setProperty("_method", "POST")
+        reply.setProperty("_path", path)
+        reply.finished.connect(lambda: self._on_finished(reply))
+
     def _request(self, method: str, path: str,
                  form_data: dict[str, str] | None = None,
                  tag: str = ""):
@@ -82,7 +128,7 @@ class ApiClient(QWidget):
 
         if form_data is not None:
             body = urlencode(form_data).encode("utf-8")
-            req.setHeader(b"Content-Type", b"application/x-www-form-urlencoded")
+            req.setRawHeader(b"Content-Type", b"application/x-www-form-urlencoded")
             req.setRawHeader(b"Content-Length", str(len(body)).encode())
             if method == "POST":
                 reply = self._mgr.post(req, body)
@@ -128,17 +174,124 @@ class ApiClient(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# 新建项目对话框
+# 新建项目对话框（支持拖拽上传图片 / 视频 / 压缩包）
 # ---------------------------------------------------------------------------
 
+# 允许的文件扩展名
+IMAGE_EXTS  = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".pgm", ".ppm"}
+VIDEO_EXTS  = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".wmv", ".flv"}
+ARCHIVE_EXTS = {".zip", ".tar", ".gz", ".7z", ".rar"}
+ALLOWED_EXTS = IMAGE_EXTS | VIDEO_EXTS | ARCHIVE_EXTS
+
+# 文件大小上限（单文件 4 GB）
+MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024
+
+
+def _format_size(size_bytes: int) -> str:
+    """人类可读的文件大小。"""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+
+def _file_icon(ext: str) -> str:
+    if ext in IMAGE_EXTS:   return "🖼"
+    if ext in VIDEO_EXTS:   return "🎬"
+    if ext in ARCHIVE_EXTS: return "📦"
+    return "📄"
+
+
+class DropZone(QFrame):
+    """拖拽 / 点击选择文件区域。"""
+
+    files_added = Signal(list)  # list[str] — 文件路径列表
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setObjectName("dropZone")
+        self.setMinimumHeight(120)
+        self.setCursor(Qt.PointingHandCursor)
+
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignCenter)
+
+        self._icon = QLabel("📁")
+        self._icon.setAlignment(Qt.AlignCenter)
+        self._icon.setStyleSheet("font-size:32px;")
+        layout.addWidget(self._icon)
+
+        self._hint = QLabel("拖拽图片 / 视频 / 压缩包到此处，或点击选择文件")
+        self._hint.setAlignment(Qt.AlignCenter)
+        self._hint.setStyleSheet("color:#8b949e; font-size:12px;")
+        layout.addWidget(self._hint)
+
+        self._sub = QLabel("支持 jpg, png, tif, mp4, avi, mov, zip 等格式")
+        self._sub.setAlignment(Qt.AlignCenter)
+        self._sub.setStyleSheet("color:#484f58; font-size:11px;")
+        layout.addWidget(self._sub)
+
+    # -- stylesheet fallback --
+    def _apply_drop_style(self, active: bool):
+        if active:
+            self.setStyleSheet(
+                "#dropZone { border:2px dashed #58a6ff; border-radius:8px;"
+                " background-color:#1c2533; }"
+            )
+        else:
+            self.setStyleSheet("")
+
+    def mousePressEvent(self, event):
+        self._open_file_dialog()
+        super().mousePressEvent(event)
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            self._apply_drop_style(True)
+
+    def dragLeaveEvent(self, event):
+        self._apply_drop_style(False)
+
+    def dropEvent(self, event: QDropEvent):
+        self._apply_drop_style(False)
+        urls = event.mimeData().urls()
+        paths = []
+        for url in urls:
+            p = url.toLocalFile()
+            if p and os.path.isfile(p):
+                paths.append(p)
+        if paths:
+            self.files_added.emit(paths)
+
+    def _open_file_dialog(self):
+        filters = (
+            "所有支持格式 (*.jpg *.jpeg *.png *.tif *.tiff *.bmp *.pgm *.ppm"
+            " *.mp4 *.avi *.mov *.mkv *.webm *.wmv *.flv *.zip *.tar *.gz *.7z *.rar);;"
+            "图片 (*.jpg *.jpeg *.png *.tif *.tiff *.bmp *.pgm *.ppm);;"
+            "视频 (*.mp4 *.avi *.mov *.mkv *.webm *.wmv *.flv);;"
+            "压缩包 (*.zip *.tar *.gz *.7z *.rar);;"
+            "所有文件 (*)"
+        )
+        files, _ = QFileDialog.getOpenFileNames(self, "选择文件", "", filters)
+        if files:
+            self.files_added.emit(files)
+
+
 class CreateProjectDialog(QDialog):
-    """创建新项目的对话框。"""
+    """创建新项目的对话框 — 填写名称 + 可选上传文件。"""
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("新建项目")
-        self.setMinimumWidth(400)
+        self.setMinimumSize(520, 500)
         self.setModal(True)
+        self._files: list[str] = []     # 选中的文件路径列表
 
         layout = QVBoxLayout(self)
         layout.setSpacing(16)
@@ -149,7 +302,7 @@ class CreateProjectDialog(QDialog):
         title.setObjectName("pageTitle")
         layout.addWidget(title)
 
-        # 项目名称输入
+        # 项目名称
         name_layout = QVBoxLayout()
         label = QLabel("项目名称")
         label.setStyleSheet("font-weight:600; font-size:13px; color:#c9d1d9;")
@@ -160,6 +313,25 @@ class CreateProjectDialog(QDialog):
         self.name_input.returnPressed.connect(self._on_create)
         name_layout.addWidget(self.name_input)
         layout.addLayout(name_layout)
+
+        # 拖拽区
+        upload_label = QLabel("上传文件（可选，创建后也可添加）")
+        upload_label.setStyleSheet("font-weight:600; font-size:13px; color:#c9d1d9;")
+        layout.addWidget(upload_label)
+
+        self._drop_zone = DropZone()
+        self._drop_zone.files_added.connect(self._add_files)
+        layout.addWidget(self._drop_zone)
+
+        # 文件列表
+        self._file_list_label = QLabel("")
+        self._file_list_label.setStyleSheet("color:#8b949e; font-size:11px;")
+        self._file_list_label.setVisible(False)
+        layout.addWidget(self._file_list_label)
+
+        self._file_list = QVBoxLayout()
+        self._file_list.setSpacing(2)
+        layout.addLayout(self._file_list)
 
         layout.addStretch()
 
@@ -177,6 +349,123 @@ class CreateProjectDialog(QDialog):
         btn_row.addWidget(self.create_btn)
         layout.addLayout(btn_row)
 
+    # ------------------------------------------------------------------
+    # 文件管理
+    # ------------------------------------------------------------------
+
+    def _add_files(self, paths: list[str]):
+        added = 0
+        skipped_size = 0
+        skipped_dup = 0
+        for p in paths:
+            if p in self._files:
+                skipped_dup += 1
+                continue
+            try:
+                size = os.path.getsize(p)
+            except OSError:
+                continue
+            if size > MAX_FILE_SIZE:
+                skipped_size += 1
+                continue
+            ext = Path(p).suffix.lower()
+            if ext not in ALLOWED_EXTS:
+                continue
+            self._files.append(p)
+            added += 1
+            self._add_file_row(p, ext, size)
+
+        if skipped_size:
+            QMessageBox.information(
+                self, "提示",
+                f"跳过了 {skipped_size} 个超过 4GB 的大文件。"
+            )
+
+        self._update_summary()
+
+    def _add_file_row(self, path: str, ext: str, size: int):
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 2, 0, 2)
+
+        icon = QLabel(f"{_file_icon(ext)} {Path(path).name}")
+        icon.setStyleSheet("color:#c9d1d9; font-size:12px;")
+        row.addWidget(icon, 1)
+
+        size_label = QLabel(_format_size(size))
+        size_label.setStyleSheet("color:#8b949e; font-size:11px;")
+        row.addWidget(size_label)
+
+        remove_btn = QPushButton("✕")
+        remove_btn.setFixedSize(20, 20)
+        remove_btn.setCursor(Qt.PointingHandCursor)
+        remove_btn.setStyleSheet(
+            "QPushButton { border:none; color:#8b949e; font-size:12px; }"
+            "QPushButton:hover { color:#da3633; }"
+        )
+        remove_btn.clicked.connect(lambda: self._remove_file(path))
+        row.addWidget(remove_btn)
+
+        self._file_list.addLayout(row)
+
+    def _remove_file(self, path: str):
+        if path in self._files:
+            self._files.remove(path)
+        # 重建文件列表 UI
+        self._rebuild_file_list()
+        self._update_summary()
+
+    def _rebuild_file_list(self):
+        """清除并重建文件列表 UI。"""
+        while self._file_list.count():
+            item = self._file_list.takeAt(0)
+            if item.layout():
+                # 递归清理子 widget
+                self._clear_layout(item.layout())
+            if item.widget():
+                item.widget().deleteLater()
+        for fp in self._files:
+            ext = Path(fp).suffix.lower()
+            try:
+                size = os.path.getsize(fp)
+            except OSError:
+                size = 0
+            self._add_file_row(fp, ext, size)
+
+    def _clear_layout(self, layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+            if item.layout():
+                self._clear_layout(item.layout())
+
+    def _update_summary(self):
+        n = len(self._files)
+        if n == 0:
+            self._file_list_label.setVisible(False)
+        else:
+            total_size = sum(
+                os.path.getsize(fp) for fp in self._files
+                if os.path.isfile(fp)
+            )
+            images = sum(1 for fp in self._files
+                        if Path(fp).suffix.lower() in IMAGE_EXTS)
+            videos = sum(1 for fp in self._files
+                        if Path(fp).suffix.lower() in VIDEO_EXTS)
+            archives = sum(1 for fp in self._files
+                          if Path(fp).suffix.lower() in ARCHIVE_EXTS)
+
+            parts = [f"共 {n} 个文件 ({_format_size(total_size)})"]
+            if images:   parts.append(f"{images} 图片")
+            if videos:   parts.append(f"{videos} 视频")
+            if archives: parts.append(f"{archives} 压缩包")
+            self._file_list_label.setText(" · ".join(parts))
+            self._file_list_label.setVisible(True)
+
+    # ------------------------------------------------------------------
+    # 提交
+    # ------------------------------------------------------------------
+
     def _on_create(self):
         name = self.name_input.text().strip()
         if not name:
@@ -189,6 +478,9 @@ class CreateProjectDialog(QDialog):
 
     def project_name(self) -> str:
         return self.name_input.text().strip()
+
+    def files(self) -> list[str]:
+        return list(self._files)
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +811,7 @@ class ProjectsPage(BasePage):
         self._projects: dict[str, dict] = {}          # 缓存列表数据
         self._selected_project: str = ""               # 当前选中
         self._detail_loaded: set[str] = set()          # 已加载详情的项目
+        self._pending_uploads: list[str] = []           # 待上传文件（创建后）
 
         # --- 操作栏 ---
         toolbar = QHBoxLayout()
@@ -606,14 +899,42 @@ class ProjectsPage(BasePage):
         if tag == "create_project":
             if error:
                 QMessageBox.warning(self, "创建失败", str(error))
+                self._reset_create_btn()
             else:
                 project_name = payload.get("data", {}).get("project_name", "")
-                self._status_label.setText(f"✓ 项目 {project_name} 已创建")
-                self._refresh_list()
-                # 自动选中新项目并加载详情
-                if project_name:
-                    self._selected_project = project_name
-                    self._load_project_detail(project_name)
+                # 如果有待上传文件，先上传再刷新
+                if self._pending_uploads and project_name:
+                    self._status_label.setText(f"项目已创建，正在上传 {len(self._pending_uploads)} 个文件...")
+                    self._api.upload_files(
+                        project_name, self._pending_uploads,
+                        tag=f"upload_to:{project_name}",
+                    )
+                    self._pending_uploads = []
+                else:
+                    self._status_label.setText(f"✓ 项目 {project_name} 已创建")
+                    self._refresh_list()
+                    if project_name:
+                        self._selected_project = project_name
+                        self._load_project_detail(project_name)
+                    self._reset_create_btn()
+
+        # ── 文件上传响应 ──
+        elif tag.startswith("upload_to:"):
+            project_name = tag.split(":", 1)[1]
+            if error:
+                QMessageBox.warning(
+                    self, "上传失败",
+                    f"项目已创建，但文件上传失败：{error}",
+                )
+            else:
+                num_images = payload.get("data", {}).get("num_images", 0)
+                self._status_label.setText(
+                    f"✓ 项目 {project_name} 已创建，{num_images} 张图片已上传"
+                )
+            self._refresh_list()
+            if project_name:
+                self._selected_project = project_name
+                self._load_project_detail(project_name)
             self._reset_create_btn()
 
         # ── 删除项目响应 ──
@@ -751,11 +1072,14 @@ class ProjectsPage(BasePage):
             return
 
         name = dialog.project_name()
+        files = dialog.files()
+
         self._create_btn.setEnabled(False)
         self._create_btn.setText("创建中...")
+        self._pending_uploads = files
         self._api.post("/api/projects", {"name": name}, tag="create_project")
-        # 恢复按钮（等响应回来后恢复，这里先设个定时器兜底）
-        QTimer.singleShot(3000, self._reset_create_btn)
+        # 兜底：如果 10 秒后还没恢复就重置按钮
+        QTimer.singleShot(10000, self._reset_create_btn)
 
     def _reset_create_btn(self):
         self._create_btn.setEnabled(True)

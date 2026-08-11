@@ -59,6 +59,7 @@ from modules.sam_runner import (
     run_sam_async,
 )
 from modules.task_manager import (
+    DATA_DIR,
     _input_image_dir,
     _mvs_output_dir,
     _sfm_output_dir,
@@ -315,6 +316,51 @@ async def upload_images(
     return {"success": True, "message": f"{num} images in project", "data": {"num_images": num}}
 
 
+@app.get("/api/projects/{project_name}/images/list")
+async def list_project_images(project_name: str):
+    """List all image filenames in a project."""
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    img_dir = _input_image_dir(project_name)
+    if not img_dir.is_dir():
+        return {"project_name": project_name, "images": []}
+
+    exts = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".pgm", ".ppm"}
+    files = sorted([
+        f.name for f in img_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in exts
+    ])
+    return {"project_name": project_name, "images": files}
+
+
+@app.get("/api/projects/{project_name}/images/view/{filename:path}")
+async def view_project_image(project_name: str, filename: str):
+    """Serve an image file from the project's input_image directory."""
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    safe = os.path.normpath(filename)
+    if safe.startswith("..") or safe.startswith("/"):
+        raise HTTPException(400, "Invalid filename")
+
+    img_dir = _input_image_dir(project_name)
+    file_path = img_dir / safe
+    if not file_path.is_file():
+        raise HTTPException(404, f"Image not found: {filename}")
+
+    ext = file_path.suffix.lower()
+    media_map = {
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".png": "image/png", ".tif": "image/tiff", ".tiff": "image/tiff",
+        ".bmp": "image/bmp", ".pgm": "image/x-portable-graymap",
+        ".ppm": "image/x-portable-pixmap",
+    }
+    return FileResponse(file_path, media_type=media_map.get(ext, "image/png"))
+
+
 # ---------------------------------------------------------------------------
 # API Routes — Image Preprocessing
 # ---------------------------------------------------------------------------
@@ -490,6 +536,38 @@ async def run_pipeline(
     return {"success": True, "message": f"Pipeline started for {project_name}"}
 
 
+@app.post("/api/projects/{project_name}/stop")
+async def stop_pipeline(project_name: str):
+    """Stop a running pipeline — kill the subprocess and update status."""
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    if not is_process_running(project_name):
+        raise HTTPException(400, "No pipeline is running for this project")
+
+    proc = get_process(project_name)
+    if proc is not None:
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+        except Exception as e:
+            logger.warning("Project %r: error killing process: %s", project_name, e)
+
+    remove_process(project_name)
+    update_project(
+        project_name,
+        status=TaskStatus.FAILED.value,
+        error_message="Pipeline stopped by user",
+        finished_at=datetime.now(timezone.utc).isoformat(),
+    )
+    logger.info("Project %r: pipeline stopped by user", project_name)
+    return {"success": True, "message": f"Pipeline for {project_name} stopped"}
+
+
 @app.get("/api/projects/{project_name}/log")
 async def get_pipeline_log(project_name: str, lines: int = 100):
     """Get pipeline log."""
@@ -540,9 +618,232 @@ def _check_sam_completion(project_name: str) -> None:
         remove_sam_process(project_name)
 
 
+async def _ensure_sam3_container() -> None:
+    """Make sure the sam3 container is running; start it if stopped."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "inspect", "-f", "{{.State.Running}}", "sam3",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0 and stdout.decode().strip() == "true":
+            return  # already running
+    except FileNotFoundError:
+        raise HTTPException(500, "Docker not available")
+
+    # Container exists but not running, or doesn't exist — start it
+    logger.info("sam3 container not running, starting...")
+    try:
+        # Try docker start first (container exists but stopped)
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "start", "sam3",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError("docker start sam3 failed")
+    except Exception:
+        raise HTTPException(
+            500,
+            "sam3 container is not available. Please create it first:\n"
+            "  docker run -d --name sam3 --gpus all -v /path/to/data:/data sam3-image",
+        )
+
+    # Wait for container to be ready
+    for _ in range(30):
+        await asyncio.sleep(1)
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "inspect", "-f", "{{.State.Running}}", "sam3",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0 and stdout.decode().strip() == "true":
+            logger.info("sam3 container is now running")
+            return
+    raise HTTPException(500, "sam3 container started but not ready after 30s")
+
+
+async def _setup_sam_script() -> None:
+    """Copy SAM_box.py into DATA_DIR if not already present."""
+    script_src = Path(__file__).parent / "algorithm" / "SAM_box.py"
+    script_dst = DATA_DIR / "sam_box.py"
+    if script_src.exists() and not script_dst.exists():
+        shutil.copy(script_src, script_dst)
+
+
 # ---------------------------------------------------------------------------
 # API Routes — SAM
 # ---------------------------------------------------------------------------
+
+@app.post("/api/projects/{project_name}/sam/box-segment")
+async def sam_box_segment(
+    project_name: str,
+    filename: str = Form(...),
+    x1: int = Form(...),
+    y1: int = Form(...),
+    x2: int = Form(...),
+    y2: int = Form(...),
+):
+    """Run SAM inference on a single image with a box prompt.
+
+    Runs inside the sam3 container. Returns paths to mask and overlay images.
+    """
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    safe = os.path.normpath(filename)
+    if safe.startswith("..") or safe.startswith("/"):
+        raise HTTPException(400, "Invalid filename")
+
+    img_dir = _input_image_dir(project_name)
+    image_path = img_dir / safe
+    if not image_path.is_file():
+        raise HTTPException(404, f"Image not found: {filename}")
+
+    # Paths inside the container
+    container_image = f"/data/{project_name}/Input/input_image/{safe}"
+    container_output = f"/data/{project_name}/SAM_output/box_results"
+
+    await _setup_sam_script()
+    await _ensure_sam3_container()
+
+    cmd = [
+        "docker", "exec", "sam3",
+        "python3", "/data/sam_box.py",
+        "--image", container_image,
+        "--box", f"{x1},{y1},{x2},{y2}",
+        "--output", container_output,
+    ]
+
+    logger.info("Project %r: SAM box-segment on %s box=(%d,%d,%d,%d)",
+                project_name, safe, x1, y1, x2, y2)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=60,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(500, "SAM inference timed out (60s)")
+    except FileNotFoundError:
+        raise HTTPException(500, "Docker not available — is Docker running?")
+
+    if proc.returncode != 0:
+        err = stderr.decode() if stderr else "Unknown error"
+        logger.error("SAM box-segment failed: %s", err)
+        raise HTTPException(500, f"SAM inference failed: {err[:200]}")
+
+    try:
+        result = json.loads(stdout.decode())
+    except json.JSONDecodeError:
+        raise HTTPException(500, f"Invalid SAM output: {stdout.decode()[:200]}")
+
+    if not result.get("success"):
+        raise HTTPException(500, result.get("error", "SAM inference failed"))
+
+    return {
+        "success": True,
+        "message": "Box segmentation completed",
+        "data": {
+            "mask_path": result.get("mask_path"),
+            "overlay_path": result.get("overlay_path"),
+            "box": result.get("box"),
+        },
+    }
+
+
+@app.post("/api/projects/{project_name}/sam/warmup")
+async def sam_warmup(project_name: str):
+    """Pre-load the SAM model to GPU by running a lightweight inference.
+
+    Uses the first available image in the project to trigger model loading.
+    """
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    img_dir = _input_image_dir(project_name)
+    if not img_dir.is_dir():
+        raise HTTPException(400, "Project has no input images")
+
+    exts = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".pgm", ".ppm"}
+    images = sorted([
+        f for f in img_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in exts
+    ])
+    if not images:
+        raise HTTPException(400, "Project has no images")
+
+    first_image = images[0]
+    container_image = f"/data/{project_name}/Input/input_image/{first_image.name}"
+    container_output = f"/data/{project_name}/SAM_output/box_results"
+
+    await _setup_sam_script()
+    await _ensure_sam3_container()
+
+    cmd = [
+        "docker", "exec", "sam3",
+        "python3", "/data/sam_box.py",
+        "--image", container_image,
+        "--box", "0,0,64,64",  # tiny box for fast warmup
+        "--output", container_output,
+    ]
+
+    logger.info("Project %r: SAM warmup (loading model to GPU)", project_name)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=120,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(500, "SAM warmup timed out (120s)")
+    except FileNotFoundError:
+        raise HTTPException(500, "Docker not available — is Docker running?")
+
+    if proc.returncode != 0:
+        err = stderr.decode() if stderr else "Unknown error"
+        logger.error("SAM warmup failed: %s", err)
+        raise HTTPException(500, f"SAM warmup failed: {err[:200]}")
+
+    return {"success": True, "message": "SAM model loaded to GPU"}
+
+
+@app.get("/api/projects/{project_name}/sam/box-result/{filename}")
+async def get_sam_box_result(project_name: str, filename: str):
+    """Serve a SAM box-segmentation result image from SAM_output/box_results/."""
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    safe = os.path.normpath(filename)
+    if safe.startswith("..") or safe.startswith("/"):
+        raise HTTPException(400, "Invalid filename")
+
+    result_dir = DATA_DIR / project_name / "SAM_output" / "box_results"
+    file_path = result_dir / safe
+    if not file_path.is_file():
+        raise HTTPException(404, f"Result image not found: {filename}")
+
+    ext = file_path.suffix.lower()
+    media_map = {
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".png": "image/png",
+    }
+    return FileResponse(file_path, media_type=media_map.get(ext, "image/png"))
+
 
 @app.post("/api/projects/{project_name}/sam/run")
 async def run_sam(

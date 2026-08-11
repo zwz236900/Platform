@@ -234,6 +234,17 @@ QProgressBar::chunk {
     border-radius: 4px;
 }
 
+/* --- 拖拽区 --- */
+#dropZone {
+    border: 2px dashed #30363d;
+    border-radius: 8px;
+    background-color: #0d1117;
+}
+#dropZone:hover {
+    border-color: #484f58;
+    background-color: #161b22;
+}
+
 /* --- 滚动区域 --- */
 QScrollArea {
     border: none;

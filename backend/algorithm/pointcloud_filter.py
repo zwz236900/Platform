@@ -53,8 +53,10 @@ def run(
                 "num_points_after": 0, "error": f"Project not found: {project}"}
 
     # Resolve paths (default to undistorted sparse + MVS dense)
-    # Check both colmap and openmvs subdirectories
+    # Check both colmap and openmvs subdirectories, plus direct densify output
     _default_ply = project / "MVS_output" / "colmap" / "fused.ply"
+    if not _default_ply.exists():
+        _default_ply = project / "MVS_output" / "openmvs" / "scene_dense.ply"
     if not _default_ply.exists():
         _default_ply = project / "MVS_output" / "openmvs" / "scene_dense_mesh.ply"
     if not _default_ply.exists():
