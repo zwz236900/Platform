@@ -264,39 +264,53 @@ class ImageCanvas(QLabel):
 # ---------------------------------------------------------------------------
 
 class PointCanvas(ImageCanvas):
-    """支持点选交互的图片显示控件 — 单击选择目标，无需画框。"""
+    """多点选择控件 — 左键添加正点（绿），右键添加负点（红），按钮触发分割。"""
 
-    point_clicked = Signal(int, int)  # x, y (图像坐标)
+    points_changed = Signal()  # 点集合发生变化
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(interactive=True, parent=parent)
-        self._point_marker: QPoint | None = None  # 图像坐标的点击位置
+        self._points: list[tuple[int, int, int]] = []  # (x, y, label) 1=正 0=负
 
-    def set_point_marker(self, x: int, y: int):
-        """设置点击位置标记（蓝色十字）。"""
-        self._point_marker = QPoint(x, y)
+    # -- 访问器 ----------------------------------------------------------
+
+    def points(self) -> list[tuple[int, int, int]]:
+        return list(self._points)
+
+    def set_points(self, pts: list[tuple[int, int, int]]):
+        self._points = list(pts)
         self.update()
 
-    def clear_point(self):
-        self._point_marker = None
+    def clear_points(self):
+        self._points.clear()
         self.update()
 
-    # ------------------------------------------------------------------
-    # 鼠标事件 — 点选模式（不画框）
-    # ------------------------------------------------------------------
+    def add_point(self, x: int, y: int, label: int):
+        self._points.append((x, y, label))
+        self.update()
+
+    # -- 鼠标事件 --------------------------------------------------------
 
     def mousePressEvent(self, event: QMouseEvent):
-        if self._interactive and event.button() == Qt.LeftButton and self._pixmap:
+        if not self._interactive or not self._pixmap:
+            super().mousePressEvent(event)
+            return
+
+        label = None
+        if event.button() == Qt.LeftButton:
+            label = 1   # 正点（前景）
+        elif event.button() == Qt.RightButton:
+            label = 0   # 负点（背景）
+
+        if label is not None:
             img_pos = self._widget_to_image(event.pos())
-            self.set_point_marker(img_pos.x(), img_pos.y())
-            self.point_clicked.emit(img_pos.x(), img_pos.y())
+            self.add_point(img_pos.x(), img_pos.y(), label)
+            self.points_changed.emit()
             event.accept()
             return
         super().mousePressEvent(event)
 
-    # ------------------------------------------------------------------
-    # 绘制 — 蓝色十字标记 + 可选预览遮罩
-    # ------------------------------------------------------------------
+    # -- 绘制 ------------------------------------------------------------
 
     def paintEvent(self, event: QPaintEvent):
         super().paintEvent(event)
@@ -304,25 +318,31 @@ class PointCanvas(ImageCanvas):
             return
 
         painter = QPainter(self)
+        for (x, y, label) in self._points:
+            widget_pos = self._image_to_widget(QPoint(x, y))
+            if label == 1:
+                color = QColor("#3fb950")  # 绿色正点
+                sym = "+"
+            else:
+                color = QColor("#f85149")  # 红色负点
+                sym = "−"
 
-        # 绘制点击位置十字标记
-        if self._point_marker:
-            widget_pos = self._image_to_widget(self._point_marker)
-            pen = QPen(QColor("#58a6ff"), 2, Qt.SolidLine)
+            pen = QPen(color, 2, Qt.SolidLine)
             painter.setPen(pen)
-            # 水平线
-            painter.drawLine(
-                widget_pos.x() - 12, widget_pos.y(),
-                widget_pos.x() + 12, widget_pos.y(),
-            )
-            # 竖直线
-            painter.drawLine(
-                widget_pos.x(), widget_pos.y() - 12,
-                widget_pos.x(), widget_pos.y() + 12,
-            )
+            # 十字线
+            painter.drawLine(widget_pos.x() - 12, widget_pos.y(),
+                             widget_pos.x() + 12, widget_pos.y())
+            painter.drawLine(widget_pos.x(), widget_pos.y() - 12,
+                             widget_pos.x(), widget_pos.y() + 12)
             # 外圈
             painter.setBrush(Qt.NoBrush)
             painter.drawEllipse(widget_pos, 8, 8)
+            # 序号标签
+            font = QFont("Consolas", 11, QFont.Bold)
+            painter.setFont(font)
+            painter.setPen(color)
+            painter.drawText(widget_pos.x() + 14, widget_pos.y() + 5,
+                             f"#{len(self._points)} {sym}")
 
         painter.end()
 
@@ -392,7 +412,7 @@ class BoxSelectionPanel(QWidget):
 
         self._load_model_btn = QPushButton("🚀 加载 SAM 模型")
         self._load_model_btn.setObjectName("primaryBtn")
-        self._load_model_btn.clicked.connect(self._on_load_model)
+        self._load_model_btn.clicked.connect(self._on_toggle_model)
         ctrl_row.addWidget(self._load_model_btn)
 
         self._segment_btn = QPushButton("✂ 分割")
@@ -497,6 +517,7 @@ class BoxSelectionPanel(QWidget):
         self._images = []
         self._current_idx = -1
         self._box_cache.clear()
+        self._result_cache.clear()
         self._last_segmented_box = None
         self._left_canvas.clear_box()
         self._page_spin.setEnabled(False)
@@ -551,6 +572,13 @@ class BoxSelectionPanel(QWidget):
             self._right_canvas.set_image(cached_result)
         else:
             self._right_canvas.set_image(QPixmap())
+            # 尝试从磁盘加载已有的分割结果（上次打开项目时保存的）
+            if 0 <= idx < len(self._images):
+                stem = Path(self._images[idx]).stem
+                self._api.fetch_image(
+                    f"/api/projects/{self._project}/sam/box-result/{stem}_contour.png",
+                    tag="box_right_image",
+                )
 
         # 加载原图
         self._load_current_image()
@@ -588,17 +616,36 @@ class BoxSelectionPanel(QWidget):
     # 操作
     # ------------------------------------------------------------------
 
+    def _on_toggle_model(self):
+        """Toggle between load and release."""
+        if self._model_loaded:
+            self._on_release_model()
+        else:
+            self._on_load_model()
+
     def _on_load_model(self):
         if not self._project:
             QMessageBox.warning(self, "提示", "请先选择项目。")
             return
         self._load_model_btn.setEnabled(False)
-        self._load_model_btn.setText("⏳ 加载中（含启动容器）...")
+        self._load_model_btn.setText("⏳ 正在加载...")
         self._log_msg("正在启动 sam3 容器并加载模型到 GPU...")
         self._status_label.setText("正在加载 SAM 模型...")
         self._api.post(
             f"/api/projects/{self._project}/sam/warmup",
             tag="warmup",
+        )
+
+    def _on_release_model(self):
+        if not self._project:
+            return
+        self._load_model_btn.setEnabled(False)
+        self._load_model_btn.setText("⏳ 正在释放...")
+        self._log_msg("正在释放 SAM 模型显存...")
+        self._status_label.setText("正在释放 SAM 模型...")
+        self._api.post(
+            f"/api/projects/{self._project}/sam/server-release",
+            tag="box_release",
         )
 
     def _on_segment(self):
@@ -691,11 +738,24 @@ class BoxSelectionPanel(QWidget):
                 self._status_label.setText("模型加载失败")
                 QMessageBox.warning(self, "SAM 模型加载失败", str(error))
             else:
-                self._load_model_btn.setText("✅ SAM 已就绪")
+                self._load_model_btn.setEnabled(True)
+                self._load_model_btn.setText("🗑 释放 SAM 模型")
                 self._model_loaded = True
                 self._segment_btn.setEnabled(True)
                 self._log_msg("✓ SAM 模型已加载到 GPU")
                 self._status_label.setText("SAM 就绪，请在原图上画框")
+
+        elif tag == "box_release":
+            self._load_model_btn.setEnabled(True)
+            if error:
+                self._log_msg(f"✗ 释放模型失败: {error}")
+                self._status_label.setText("释放失败")
+            else:
+                self._load_model_btn.setText("🚀 加载 SAM 模型")
+                self._model_loaded = False
+                self._segment_btn.setEnabled(False)
+                self._log_msg("✓ SAM 模型已释放，显存已清空")
+                self._status_label.setText("模型已释放")
 
         # ── 分割结果 ──
         elif tag == "box_segment":
@@ -757,7 +817,7 @@ class BoxSelectionPanel(QWidget):
 # ---------------------------------------------------------------------------
 
 class PointSelectionPanel(QWidget):
-    """点选分割 — 单击图片上的目标物体，SAM3 自动分割。"""
+    """点选分割 — 左键正点(绿) + 右键负点(红)，多点选择后手动分割。"""
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -769,9 +829,13 @@ class PointSelectionPanel(QWidget):
         self._images: list[str] = []
         self._current_idx: int = -1
         self._model_loaded: bool = False
-        self._point_cache: dict[int, tuple[int, int]] = {}
+        self._point_cache: dict[int, list[tuple[int, int, int]]] = {}
         self._result_cache: dict[int, QPixmap] = {}
-        self._last_segmented_point: tuple[int, int] | None = None
+        self._batch_queue: list[int] = []
+        self._batch_total: int = 0
+        self._batch_done: int = 0
+        self._batch_mode: bool = False
+        self._pending_points_idx: int = -1  # 等待图片加载完成后恢复标点的索引
 
         # ── 布局 ──
         layout = QVBoxLayout(self)
@@ -808,17 +872,29 @@ class PointSelectionPanel(QWidget):
         ctrl_row = QHBoxLayout()
         self._load_model_btn = QPushButton("🚀 加载 SAM 模型")
         self._load_model_btn.setObjectName("primaryBtn")
-        self._load_model_btn.clicked.connect(self._on_load_model)
+        self._load_model_btn.clicked.connect(self._on_toggle_model)
         ctrl_row.addWidget(self._load_model_btn)
 
-        self._segment_btn = QPushButton("🖱 分割")
+        self._segment_btn = QPushButton("✂ 分割")
         self._segment_btn.setObjectName("primaryBtn")
         self._segment_btn.setEnabled(False)
         self._segment_btn.clicked.connect(self._on_segment)
         ctrl_row.addWidget(self._segment_btn)
 
+        self._batch_btn = QPushButton("📦 批量分割")
+        self._batch_btn.setObjectName("primaryBtn")
+        self._batch_btn.setEnabled(False)
+        self._batch_btn.setToolTip("对所有已标点的图片执行分割")
+        self._batch_btn.clicked.connect(self._on_batch_segment)
+        ctrl_row.addWidget(self._batch_btn)
+
+        self._clear_pts_btn = QPushButton("✕ 清除点")
+        self._clear_pts_btn.setObjectName("actionBtn")
+        self._clear_pts_btn.clicked.connect(self._on_clear_points)
+        ctrl_row.addWidget(self._clear_pts_btn)
+
         ctrl_row.addStretch()
-        self._point_info_label = QLabel("")
+        self._point_info_label = QLabel("左键正点 · 右键负点")
         self._point_info_label.setStyleSheet("color:#8b949e; font-size:12px;")
         ctrl_row.addWidget(self._point_info_label)
         self._status_label = QLabel("就绪")
@@ -833,11 +909,11 @@ class PointSelectionPanel(QWidget):
         left_container = QWidget()
         left_layout = QVBoxLayout(left_container)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_header = QLabel("原图（单击目标物体 · ↑↓ 键切换）")
+        left_header = QLabel("原图（左键正点 · 右键负点 · ↑↓ 键切换）")
         left_header.setStyleSheet("color:#8b949e; font-size:12px; padding:4px;")
         left_layout.addWidget(left_header)
         self._left_canvas = PointCanvas()
-        self._left_canvas.point_clicked.connect(self._on_point_clicked)
+        self._left_canvas.points_changed.connect(self._on_points_changed)
         self._left_canvas.setFocusPolicy(Qt.StrongFocus)
         self._left_canvas.installEventFilter(self)
         left_layout.addWidget(self._left_canvas, 1)
@@ -911,10 +987,9 @@ class PointSelectionPanel(QWidget):
         self._images.clear()
         self._point_cache.clear()
         self._result_cache.clear()
-        self._last_segmented_point = None
         self._current_idx = -1
         self._left_canvas.set_image(QPixmap())
-        self._left_canvas.clear_point()
+        self._left_canvas.clear_points()
         self._right_canvas.set_image(QPixmap())
         self._page_spin.setEnabled(False)
         self._total_label.setText("张")
@@ -938,13 +1013,17 @@ class PointSelectionPanel(QWidget):
         if idx < 0 or idx >= len(self._images):
             return
 
-        # 保存当前状态
-        if self._current_idx >= 0:
-            if self._left_canvas._point_marker:
-                self._point_cache[self._current_idx] = (
-                    self._left_canvas._point_marker.x(),
-                    self._left_canvas._point_marker.y(),
-                )
+        # 保存当前点集合到缓存 + 磁盘
+        if self._current_idx >= 0 and self._project:
+            pts = self._left_canvas.points()
+            if pts:
+                self._point_cache[self._current_idx] = pts
+                self._save_points_to_disk(self._current_idx)
+            else:
+                # 清空后也同步到磁盘
+                old = self._point_cache.pop(self._current_idx, None)
+                if old:
+                    self._save_points_to_disk(self._current_idx)
 
         self._current_idx = idx
         self._page_spin.blockSignals(True)
@@ -952,24 +1031,23 @@ class PointSelectionPanel(QWidget):
         self._page_spin.blockSignals(False)
         self._total_label.setText(f"/ {len(self._images)} 张")
 
-        # 恢复左图点击标记
-        if idx in self._point_cache:
-            px, py = self._point_cache[idx]
-            self._left_canvas.set_point_marker(px, py)
-            self._point_info_label.setText(f"点击: ({px}, {py})")
-        elif self._last_segmented_point:
-            px, py = self._last_segmented_point
-            self._left_canvas.set_point_marker(px, py)
-            self._point_info_label.setText(f"点击: ({px}, {py})")
-        else:
-            self._left_canvas.clear_point()
-            self._point_info_label.setText("单击物体进行分割")
+        # 先清除旧标点，等图片加载完成后再恢复（避免画在旧图上）
+        self._left_canvas.clear_points()
+        self._point_info_label.setText("左键正点 · 右键负点")
+        self._pending_points_idx = idx
 
         # 恢复右图结果
         if idx in self._result_cache:
             self._right_canvas.set_image(self._result_cache[idx])
         else:
             self._right_canvas.set_image(QPixmap())
+            # 尝试从磁盘加载已有的分割结果（上次打开项目时保存的）
+            if 0 <= idx < len(self._images):
+                stem = Path(self._images[idx]).stem
+                self._api.fetch_image(
+                    f"/api/projects/{self._project}/sam/point-result/{stem}_contour.png",
+                    tag="point_right_image",
+                )
 
         self._load_current_image()
 
@@ -986,53 +1064,235 @@ class PointSelectionPanel(QWidget):
     # 点选交互
     # ------------------------------------------------------------------
 
-    def _on_point_clicked(self, x: int, y: int):
-        """左图画布点击 → 自动触发点选分割。"""
-        self._point_info_label.setText(f"点击: ({x}, {y})")
+    def _on_points_changed(self):
+        """画布上的点集合发生变化时更新信息。"""
+        self._update_points_info()
 
-        # 如果模型未加载，先提示
-        if not self._model_loaded:
-            self._log_msg("⚠ 请先加载 SAM 模型")
-            self._status_label.setText("请先加载模型")
+    def _update_points_info(self):
+        pts = self._left_canvas.points()
+        if not pts:
+            self._point_info_label.setText("左键正点 · 右键负点")
+            return
+        pos_count = sum(1 for _, _, l in pts if l == 1)
+        neg_count = sum(1 for _, _, l in pts if l == 0)
+        parts = []
+        if pos_count:
+            parts.append(f"+{pos_count}")
+        if neg_count:
+            parts.append(f"−{neg_count}")
+        self._point_info_label.setText("正点: " + ", ".join(parts) if parts else "左键正点 · 右键负点")
+        # 模型已加载且有正点时，启用分割按钮
+        self._segment_btn.setEnabled(self._model_loaded and pos_count > 0)
+        # 批量按钮：模型已加载且有已标点图片
+        self._update_batch_btn()
+
+    def _update_batch_btn(self):
+        """根据缓存的标点数量更新批量分割按钮。"""
+        if self._model_loaded:
+            count = sum(1 for pts in self._point_cache.values() if pts)
+            self._batch_btn.setEnabled(count > 0)
+        else:
+            self._batch_btn.setEnabled(False)
+
+    def _on_clear_points(self):
+        """清除所有点。"""
+        self._left_canvas.clear_points()
+        self._point_info_label.setText("左键正点 · 右键负点")
+        self._segment_btn.setEnabled(False)
+        # 同步清除磁盘上的点数据
+        if self._project and self._current_idx >= 0:
+            self._point_cache.pop(self._current_idx, None)
+            stem = Path(self._images[self._current_idx]).stem
+            self._api.post(
+                f"/api/projects/{self._project}/sam/points/save",
+                form_data={"stem": stem, "points": "[]"},
+                tag="point_save_points",
+            )
+
+    def _restore_points_after_image_load(self):
+        """图片加载完成后恢复标点（从缓存或磁盘）。"""
+        idx = self._pending_points_idx
+        self._pending_points_idx = -1
+        if idx < 0 or idx >= len(self._images):
             return
 
-        self._do_segment(x, y)
+        if idx in self._point_cache:
+            pts = self._point_cache[idx]
+            if pts:
+                self._left_canvas.set_points(pts)
+                self._update_points_info()
+                return
 
-    def _do_segment(self, x: int, y: int):
-        """执行点选分割请求。"""
+        # 缓存未命中，尝试从磁盘加载
+        if self._project:
+            stem = Path(self._images[idx]).stem
+            self._api.get(
+                f"/api/projects/{self._project}/sam/points/load/{stem}",
+                tag="point_load_points",
+            )
+
+    def _save_points_to_disk(self, idx: int):
+        """将指定索引图片的点保存到后端磁盘。"""
+        if not self._project or idx < 0 or idx >= len(self._images):
+            return
+        stem = Path(self._images[idx]).stem
+        pts = self._point_cache.get(idx, [])
+        self._api.post(
+            f"/api/projects/{self._project}/sam/points/save",
+            form_data={"stem": stem, "points": json.dumps(pts)},
+            tag="point_save_points",
+        )
+
+    def _do_segment(self, batch: bool = False):
+        """执行多点分割请求。batch=True 时不修改按钮状态（由批量流程控制）。"""
         if not self._project or self._current_idx < 0:
             return
 
+        pts = self._left_canvas.points()
+        if not pts:
+            self._log_msg("⚠ 请先添加至少一个正点")
+            return
+
         fname = self._images[self._current_idx]
-        self._segment_btn.setEnabled(False)
-        self._segment_btn.setText("⏳ 推理中...")
+        if not batch:
+            self._segment_btn.setEnabled(False)
+            self._segment_btn.setText("⏳ 推理中...")
         self._status_label.setText("SAM 推理中...")
-        self._log_msg(f"点选分割: {fname} @ ({x}, {y})")
+        points_json = json.dumps(pts)
+        self._log_msg(f"多点分割: {fname} @ {points_json}")
 
         self._api.post(
             f"/api/projects/{self._project}/sam/point-segment",
-            form_data={"filename": fname, "x": str(x), "y": str(y)},
+            form_data={"filename": fname, "points": points_json},
             tag="point_segment",
         )
 
     def _on_segment(self):
-        """按钮触发的分割 — 使用当前点击位置。"""
-        if not self._left_canvas._point_marker:
-            self._log_msg("⚠ 请先在图片上点击目标物体")
+        """按钮触发的分割 — 使用所有已选点。"""
+        if not self._model_loaded:
+            self._log_msg("⚠ 请先加载 SAM 模型")
             return
-        x = self._left_canvas._point_marker.x()
-        y = self._left_canvas._point_marker.y()
-        self._do_segment(x, y)
+        pts = self._left_canvas.points()
+        if not pts:
+            self._log_msg("⚠ 请先在图片上添加正点（左键）和负点（右键）")
+            return
+        if not any(l == 1 for _, _, l in pts):
+            self._log_msg("⚠ 至少需要一个正点（左键）")
+            return
+        self._do_segment()
+
+    def _on_batch_segment(self):
+        """批量分割：对所有已标点的图片依次执行分割。"""
+        if not self._model_loaded:
+            self._log_msg("⚠ 请先加载 SAM 模型")
+            return
+
+        # 先保存当前图片的点到缓存
+        if self._current_idx >= 0:
+            pts = self._left_canvas.points()
+            if pts:
+                self._point_cache[self._current_idx] = pts
+                self._save_points_to_disk(self._current_idx)
+
+        # 收集所有有标点的图片索引
+        queue = sorted(idx for idx, pts in self._point_cache.items()
+                       if pts and any(l == 1 for _, _, l in pts))
+        if not queue:
+            self._log_msg(f"⚠ 没有已标点的图片（当前缓存 {len(self._point_cache)} 个索引）")
+            return
+
+        self._batch_queue = queue
+        self._batch_total = len(queue)
+        self._batch_done = 0
+        self._batch_mode = True
+        self._segment_btn.setEnabled(False)
+        self._batch_btn.setEnabled(False)
+        self._batch_btn.setText("⏳ 批量中...")
+        self._page_spin.setEnabled(False)
+        self._prev_btn.setEnabled(False)
+        self._next_btn.setEnabled(False)
+        self._log_msg(f"📦 开始批量分割 {self._batch_total} 张图片 (idx={queue})")
+        self._process_next_batch()
+
+    def _process_next_batch(self):
+        """处理队列中的下一张图片。"""
+        if not self._batch_queue:
+            # 全部完成
+            self._batch_mode = False
+            self._batch_btn.setText("📦 批量分割")
+            self._update_batch_btn()
+            self._segment_btn.setEnabled(self._model_loaded)
+            self._page_spin.setEnabled(True)
+            self._prev_btn.setEnabled(True)
+            self._next_btn.setEnabled(True)
+            self._status_label.setText(f"✓ 批量完成 ({self._batch_total} 张)")
+            self._log_msg(f"✓ 批量分割完成 ({self._batch_total} 张)")
+            return
+
+        idx = self._batch_queue.pop(0)
+        self._batch_done += 1
+        self._status_label.setText(f"批量分割中... {self._batch_done}/{self._batch_total}")
+        self._log_msg(f"📦 [{self._batch_done}/{self._batch_total}] 准备分割 idx={idx}")
+
+        # 批量模式：直接切换索引并恢复标点，不等图片加载
+        pts = self._point_cache.get(idx, [])
+        if not pts:
+            self._log_msg(f"⚠ idx={idx} 缓存中无标点，跳过")
+            self._process_next_batch()
+            return
+
+        # 保存当前图片的点（如果有的话）
+        if self._current_idx >= 0:
+            cur_pts = self._left_canvas.points()
+            if cur_pts:
+                self._point_cache[self._current_idx] = cur_pts
+
+        # 直接切换（不走 _goto_image，避免延迟恢复标点）
+        self._current_idx = idx
+        self._page_spin.blockSignals(True)
+        self._page_spin.setValue(idx + 1)
+        self._page_spin.blockSignals(False)
+        self._total_label.setText(f"/ {len(self._images)} 张")
+        self._left_canvas.clear_points()
+        self._pending_points_idx = -1  # 批量模式不需要延迟恢复
+
+        # 立即恢复标点并触发分割
+        self._left_canvas.set_points(pts)
+        self._update_points_info()
+
+        # 异步加载图片（仅用于显示，不影响分割）
+        self._load_current_image()
+
+        # 触发分割
+        self._do_segment(batch=True)
+
+    def _on_toggle_model(self):
+        """Toggle between load and release."""
+        if self._model_loaded:
+            self._on_release_model()
+        else:
+            self._on_load_model()
 
     def _on_load_model(self):
         self._load_model_btn.setEnabled(False)
-        self._load_model_btn.setText("⏳ 启动容器...")
+        self._load_model_btn.setText("⏳ 正在加载...")
         self._status_label.setText("正在启动 sam3 容器并加载模型...")
         self._log_msg("正在启动 sam3 容器并加载模型到 GPU...")
         self._api.post(
             f"/api/projects/{self._project}/sam/warmup",
             form_data={},
             tag="point_warmup",
+        )
+
+    def _on_release_model(self):
+        self._load_model_btn.setEnabled(False)
+        self._load_model_btn.setText("⏳ 正在释放...")
+        self._log_msg("正在释放 SAM 模型显存...")
+        self._status_label.setText("正在释放 SAM 模型...")
+        self._api.post(
+            f"/api/projects/{self._project}/sam/server-release",
+            form_data={},
+            tag="point_release",
         )
 
     # ------------------------------------------------------------------
@@ -1070,7 +1330,6 @@ class PointSelectionPanel(QWidget):
             self._images = payload.get("images", [])
             self._point_cache.clear()
             self._result_cache.clear()
-            self._last_segmented_point = None
             self._page_spin.setMaximum(max(1, len(self._images)))
             self._page_spin.setEnabled(len(self._images) > 0)
             self._log_msg(f"✓ 共 {len(self._images)} 张图片")
@@ -1080,6 +1339,18 @@ class PointSelectionPanel(QWidget):
                 self._left_canvas.set_image(QPixmap())
                 self._right_canvas.set_image(QPixmap())
                 self._total_label.setText("/ 0 张")
+
+        # ── 从磁盘加载标点 ──
+        elif tag == "point_load_points":
+            pts = payload.get("points", [])
+            if pts and self._current_idx >= 0:
+                self._point_cache[self._current_idx] = pts
+                # 如果当前正在显示这张图，刷新画布
+                stem = Path(self._images[self._current_idx]).stem
+                req_stem = Path(path).stem
+                if stem == req_stem:
+                    self._left_canvas.set_points(pts)
+                    self._update_points_info()
 
         # ── 左图 ──
         elif tag == "point_left_image":
@@ -1091,6 +1362,8 @@ class PointSelectionPanel(QWidget):
                 self._status_label.setText(
                     f"图片 {self._current_idx + 1}/{len(self._images)}"
                 )
+                # 图片加载完成后恢复该图的标点（缓存或磁盘）
+                self._restore_points_after_image_load()
                 if self._model_loaded:
                     self._segment_btn.setEnabled(True)
 
@@ -1098,50 +1371,72 @@ class PointSelectionPanel(QWidget):
         elif tag == "point_warmup":
             self._load_model_btn.setEnabled(True)
             if error:
+                self._load_model_btn.setText("🚀 加载 SAM 模型")
                 self._log_msg(f"✗ 模型加载失败: {error}")
                 self._status_label.setText("模型加载失败")
                 QMessageBox.warning(self, "加载失败", str(error))
             else:
-                self._load_model_btn.setText("✅ SAM 已就绪")
+                self._load_model_btn.setText("🗑 释放 SAM 模型")
                 self._model_loaded = True
                 self._segment_btn.setEnabled(True)
+                self._update_batch_btn()
                 self._log_msg("✓ SAM 模型已加载到 GPU")
-                self._status_label.setText("SAM 就绪，请点击图片上的目标物体")
+                self._status_label.setText("SAM 就绪，左键正点 · 右键负点，点击分割")
+
+        elif tag == "point_release":
+            self._load_model_btn.setEnabled(True)
+            if error:
+                self._log_msg(f"✗ 释放模型失败: {error}")
+                self._status_label.setText("释放失败")
+            else:
+                self._load_model_btn.setText("🚀 加载 SAM 模型")
+                self._model_loaded = False
+                self._segment_btn.setEnabled(False)
+                self._batch_btn.setEnabled(False)
+                self._log_msg("✓ SAM 模型已释放，显存已清空")
+                self._status_label.setText("模型已释放")
 
         # ── 分割结果 ──
         elif tag == "point_segment":
             self._segment_btn.setEnabled(True)
-            self._segment_btn.setText("🖱 分割")
+            self._segment_btn.setText("✂ 分割")
+            is_batch = self._batch_mode
             if error:
                 self._log_msg(f"✗ 分割失败: {error}")
-                self._status_label.setText("分割失败")
-                QMessageBox.warning(self, "分割失败", str(error))
+                if not is_batch:
+                    self._status_label.setText("分割失败")
+                    QMessageBox.warning(self, "分割失败", str(error))
             else:
                 resp_data = payload.get("data", {})
                 contour_path = resp_data.get("contour_path", "")
-                point = resp_data.get("point", [])
                 score = resp_data.get("score")
                 overlay_path = resp_data.get("overlay_path", "")
+                points_used = resp_data.get("points", [])
                 self._log_msg(
                     f"✓ 分割完成 → {Path(overlay_path).name}"
                     if overlay_path else "✓ 分割完成"
                 )
                 if score is not None:
-                    self._status_label.setText(f"✓ 分割完成 (置信度: {score:.2f})")
+                    self._status_label.setText(f"✓ 分割完成 (置信度: {score:.2f}, {len(points_used)}点)")
                 else:
-                    self._status_label.setText("✓ 分割完成")
-                # 缓存当前点击位置
-                cur_pt = self._left_canvas._point_marker
-                if cur_pt and self._current_idx >= 0:
-                    self._point_cache[self._current_idx] = (cur_pt.x(), cur_pt.y())
-                    self._last_segmented_point = (cur_pt.x(), cur_pt.y())
+                    self._status_label.setText(f"✓ 分割完成 ({len(points_used)}点)")
+                # 缓存当前点集合并保存到磁盘
+                if self._current_idx >= 0:
+                    pts = self._left_canvas.points()
+                    if pts:
+                        self._point_cache[self._current_idx] = pts
+                        self._save_points_to_disk(self._current_idx)
                 # 加载结果图 — 优先轮廓图
                 if contour_path:
                     result_filename = Path(contour_path).name
                     self._api.fetch_image(
-                        f"/api/projects/{self._project}/sam/box-result/{result_filename}",
+                        f"/api/projects/{self._project}/sam/point-result/{result_filename}",
                         tag="point_right_image",
                     )
+
+            # 批量模式：继续下一张
+            if is_batch:
+                self._process_next_batch()
 
         # ── 右图（分割结果）──
         elif tag == "point_right_image":

@@ -680,6 +680,140 @@ async def _setup_sam_script() -> None:
     if point_src.exists() and not point_dst.exists():
         shutil.copy(point_src, point_dst)
 
+    # Also sync SAM_CLI.py (serve-mode worker) to DATA_DIR — always copy latest
+    cli_src = Path("/home/zwz/Code/SAM/SAM_CLI.py")
+    cli_dst = DATA_DIR / "sam_worker.py"
+    if cli_src.exists():
+        shutil.copy(cli_src, cli_dst)
+
+
+# ---------------------------------------------------------------------------
+# 持久 SAM Worker 管理（模型常驻 GPU）
+# ---------------------------------------------------------------------------
+
+_worker_proc: asyncio.subprocess.Process | None = None
+_worker_lock = asyncio.Lock()
+
+
+async def _ensure_sam3_worker() -> None:
+    """Ensure the persistent SAM worker is running (model stays in GPU).
+
+    Spawns `docker exec -i sam3 python3 /data/sam_worker.py --serve`
+    and waits for the ready signal.  Uses _worker_lock to serialize
+    all communication with the single worker process.
+    """
+    global _worker_proc
+
+    await _ensure_sam3_container()
+    await _setup_sam_script()
+
+    # Already running?
+    if _worker_proc is not None:
+        if _worker_proc.returncode is None:
+            # Health check via status command
+            try:
+                resp = await _send_worker_command({"cmd": "status"}, timeout=5)
+                if resp.get("status") == "ready":
+                    return
+            except Exception:
+                pass  # Worker died, restart below
+        # Clean up dead process
+        try:
+            await _worker_proc.wait()
+        except Exception:
+            pass
+        _worker_proc = None
+
+    logger.info("Starting persistent SAM worker...")
+    proc = await asyncio.create_subprocess_exec(
+        "docker", "exec", "-i", "sam3",
+        "python3", "/data/sam_worker.py",
+        "--serve",
+        "--checkpoint", "/workspace/model/sam3.pt",
+        "--device", "cuda",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    # Wait for ready signal (timeout 120s for model loading)
+    try:
+        line = await asyncio.wait_for(proc.stdout.readline(), timeout=120)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise HTTPException(500, "SAM worker timed out during model loading (120s)")
+
+    if not line:
+        proc.kill()
+        stderr_tail = ""
+        try:
+            err = await asyncio.wait_for(proc.stderr.read(), timeout=3)
+            stderr_tail = err.decode()[-300:]
+        except Exception:
+            pass
+        raise HTTPException(500, f"SAM worker exited during startup. Stderr: {stderr_tail}")
+
+    try:
+        ready = json.loads(line.decode())
+    except json.JSONDecodeError:
+        proc.kill()
+        raise HTTPException(500, f"SAM worker sent invalid ready signal: {line.decode()[:100]}")
+
+    if ready.get("status") != "ready":
+        proc.kill()
+        raise HTTPException(500, f"SAM worker unexpected status: {ready}")
+
+    _worker_proc = proc
+    logger.info("SAM worker ready — model loaded to GPU")
+
+
+async def _send_worker_command(cmd: dict, timeout: int = 60) -> dict:
+    """Send a single JSON command to the worker and return the JSON response."""
+    async with _worker_lock:
+        if _worker_proc is None or _worker_proc.returncode is not None:
+            raise HTTPException(500, "SAM worker is not running — call _ensure_sam3_worker() first")
+
+        payload = json.dumps(cmd) + "\n"
+        try:
+            _worker_proc.stdin.write(payload.encode())
+            await _worker_proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError) as e:
+            raise HTTPException(500, f"SAM worker pipe broken: {e}")
+
+        try:
+            line = await asyncio.wait_for(_worker_proc.stdout.readline(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise HTTPException(500, f"SAM worker timed out ({timeout}s) on command: {cmd.get('cmd')}")
+
+        if not line:
+            raise HTTPException(500, "SAM worker stdout closed unexpectedly")
+
+        try:
+            return json.loads(line.decode())
+        except json.JSONDecodeError:
+            raise HTTPException(500, f"SAM worker invalid response: {line.decode()[:200]}")
+
+
+async def _release_sam3_worker() -> None:
+    """Send shutdown command to the worker and clean up."""
+    global _worker_proc
+    if _worker_proc is None or _worker_proc.returncode is not None:
+        _worker_proc = None
+        return
+
+    try:
+        await _send_worker_command({"cmd": "shutdown"}, timeout=5)
+    except Exception:
+        pass
+
+    try:
+        await asyncio.wait_for(_worker_proc.wait(), timeout=10)
+    except asyncio.TimeoutError:
+        _worker_proc.kill()
+        await _worker_proc.wait()
+    _worker_proc = None
+    logger.info("SAM worker released — GPU memory freed")
+
 
 # ---------------------------------------------------------------------------
 # API Routes — SAM
@@ -694,10 +828,7 @@ async def sam_box_segment(
     x2: int = Form(...),
     y2: int = Form(...),
 ):
-    """Run SAM inference on a single image with a box prompt.
-
-    Runs inside the sam3 container. Returns paths to mask and overlay images.
-    """
+    """Run SAM inference on a single image with a box prompt (persistent GPU worker)."""
     p = get_project(project_name)
     if p is None:
         raise HTTPException(404, "Project not found")
@@ -711,47 +842,26 @@ async def sam_box_segment(
     if not image_path.is_file():
         raise HTTPException(404, f"Image not found: {filename}")
 
-    # Paths inside the container
     container_image = f"/data/{project_name}/Input/input_image/{safe}"
     container_output = f"/data/{project_name}/SAM_output/box_results"
+    stem = Path(safe).stem
 
     await _setup_sam_script()
-    await _ensure_sam3_container()
-
-    cmd = [
-        "docker", "exec", "sam3",
-        "python3", "/data/sam_box.py",
-        "--image", container_image,
-        "--box", f"{x1},{y1},{x2},{y2}",
-        "--output", container_output,
-    ]
+    await _ensure_sam3_worker()
 
     logger.info("Project %r: SAM box-segment on %s box=(%d,%d,%d,%d)",
                 project_name, safe, x1, y1, x2, y2)
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=60,
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(500, "SAM inference timed out (60s)")
-    except FileNotFoundError:
-        raise HTTPException(500, "Docker not available — is Docker running?")
+    # Set image on worker (no-op if same as last image)
+    await _send_worker_command({"cmd": "set_image", "path": container_image})
 
-    if proc.returncode != 0:
-        err = stderr.decode() if stderr else "Unknown error"
-        logger.error("SAM box-segment failed: %s", err)
-        raise HTTPException(500, f"SAM inference failed: {err[:200]}")
-
-    try:
-        result = json.loads(stdout.decode())
-    except json.JSONDecodeError:
-        raise HTTPException(500, f"Invalid SAM output: {stdout.decode()[:200]}")
+    # Run box inference
+    result = await _send_worker_command({
+        "cmd": "box",
+        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+        "output_dir": container_output,
+        "stem": stem,
+    })
 
     if not result.get("success"):
         raise HTTPException(500, result.get("error", "SAM inference failed"))
@@ -773,13 +883,14 @@ async def sam_box_segment(
 async def sam_point_segment(
     project_name: str,
     filename: str = Form(...),
-    x: int = Form(...),
-    y: int = Form(...),
+    points: str = Form(default=""),
+    x: int = Form(default=0),   # deprecated, kept for backward compatibility
+    y: int = Form(default=0),   # deprecated, kept for backward compatibility
 ):
-    """Run SAM inference on a single image with a point prompt (click-to-segment).
+    """Run SAM inference on a single image with point prompt(s) (persistent GPU worker).
 
-    Uses SAM3's interactive predict_inst() API — click on an object, model segments it.
-    Runs inside the sam3 container.
+    points: JSON string like "[[800,600,1],[700,500,0]]"
+            label=1 positive (foreground), label=0 negative (background)
     """
     p = get_project(project_name)
     if p is None:
@@ -794,47 +905,37 @@ async def sam_point_segment(
     if not image_path.is_file():
         raise HTTPException(404, f"Image not found: {filename}")
 
-    # Paths inside the container
+    # Parse points — new multi-point JSON format, or fallback to deprecated x/y
+    if points:
+        point_list = json.loads(points)  # [[x,y,label], ...]
+    else:
+        point_list = [[x, y, 1]]
+
+    if not point_list:
+        raise HTTPException(400, "At least one point is required")
+
     container_image = f"/data/{project_name}/Input/input_image/{safe}"
-    container_output = f"/data/{project_name}/SAM_output/box_results"
+    container_output = f"/data/{project_name}/SAM_output/point_results"
+    stem = Path(safe).stem
 
     await _setup_sam_script()
-    await _ensure_sam3_container()
+    await _ensure_sam3_worker()
 
-    cmd = [
-        "docker", "exec", "sam3",
-        "python3", "/data/sam_point.py",
-        "--image", container_image,
-        "--point", f"{x},{y}",
-        "--output", container_output,
-    ]
+    pos_count = sum(1 for pt in point_list if (pt[2] if len(pt) > 2 else 1) == 1)
+    neg_count = len(point_list) - pos_count
+    logger.info("Project %r: SAM point-segment on %s points=+%d-%d",
+                project_name, safe, pos_count, neg_count)
 
-    logger.info("Project %r: SAM point-segment on %s point=(%d,%d)",
-                project_name, safe, x, y)
+    # Set image on worker (no-op if same as last image)
+    await _send_worker_command({"cmd": "set_image", "path": container_image})
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=60,
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(500, "SAM inference timed out (60s)")
-    except FileNotFoundError:
-        raise HTTPException(500, "Docker not available — is Docker running?")
-
-    if proc.returncode != 0:
-        err = stderr.decode() if stderr else "Unknown error"
-        logger.error("SAM point-segment failed: %s", err)
-        raise HTTPException(500, f"SAM inference failed: {err[:200]}")
-
-    try:
-        result = json.loads(stdout.decode())
-    except json.JSONDecodeError:
-        raise HTTPException(500, f"Invalid SAM output: {stdout.decode()[:200]}")
+    # Run point inference
+    result = await _send_worker_command({
+        "cmd": "point",
+        "points": point_list,
+        "output_dir": container_output,
+        "stem": stem,
+    })
 
     if not result.get("success"):
         raise HTTPException(500, result.get("error", "SAM inference failed"))
@@ -846,7 +947,7 @@ async def sam_point_segment(
             "mask_path": result.get("mask_path"),
             "overlay_path": result.get("overlay_path"),
             "contour_path": result.get("contour_path"),
-            "point": result.get("point"),
+            "points": result.get("points", []),
             "score": result.get("score"),
         },
     }
@@ -858,59 +959,32 @@ async def sam_warmup(project_name: str):
 
     Uses the first available image in the project to trigger model loading.
     """
-    p = get_project(project_name)
-    if p is None:
-        raise HTTPException(404, "Project not found")
-
-    img_dir = _input_image_dir(project_name)
-    if not img_dir.is_dir():
-        raise HTTPException(400, "Project has no input images")
-
-    exts = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".pgm", ".ppm"}
-    images = sorted([
-        f for f in img_dir.iterdir()
-        if f.is_file() and f.suffix.lower() in exts
-    ])
-    if not images:
-        raise HTTPException(400, "Project has no images")
-
-    first_image = images[0]
-    container_image = f"/data/{project_name}/Input/input_image/{first_image.name}"
-    container_output = f"/data/{project_name}/SAM_output/box_results"
-
+    """Pre-load the SAM model to GPU by starting the persistent worker."""
     await _setup_sam_script()
-    await _ensure_sam3_container()
-
-    cmd = [
-        "docker", "exec", "sam3",
-        "python3", "/data/sam_box.py",
-        "--image", container_image,
-        "--box", "0,0,64,64",  # tiny box for fast warmup
-        "--output", container_output,
-    ]
-
-    logger.info("Project %r: SAM warmup (loading model to GPU)", project_name)
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=120,
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(500, "SAM warmup timed out (120s)")
-    except FileNotFoundError:
-        raise HTTPException(500, "Docker not available — is Docker running?")
-
-    if proc.returncode != 0:
-        err = stderr.decode() if stderr else "Unknown error"
-        logger.error("SAM warmup failed: %s", err)
-        raise HTTPException(500, f"SAM warmup failed: {err[:200]}")
-
+    await _ensure_sam3_worker()
     return {"success": True, "message": "SAM model loaded to GPU"}
+
+
+@app.get("/api/projects/{project_name}/sam/server-status")
+async def sam_server_status(project_name: str):
+    """Return the current status of the SAM persistent worker."""
+    global _worker_proc
+    alive = _worker_proc is not None and _worker_proc.returncode is None
+    resp = {"running": alive, "model_loaded": False}
+    if alive:
+        try:
+            status = await _send_worker_command({"cmd": "status"}, timeout=3)
+            resp["model_loaded"] = status.get("model_loaded", False)
+        except Exception:
+            resp["running"] = False
+    return resp
+
+
+@app.post("/api/projects/{project_name}/sam/server-release")
+async def sam_server_release(project_name: str):
+    """Release the SAM model from GPU by shutting down the persistent worker."""
+    await _release_sam3_worker()
+    return {"success": True, "message": "SAM model released from GPU"}
 
 
 @app.get("/api/projects/{project_name}/sam/box-result/{filename}")
@@ -935,6 +1009,81 @@ async def get_sam_box_result(project_name: str, filename: str):
         ".png": "image/png",
     }
     return FileResponse(file_path, media_type=media_map.get(ext, "image/png"))
+
+
+@app.get("/api/projects/{project_name}/sam/point-result/{filename}")
+async def get_sam_point_result(project_name: str, filename: str):
+    """Serve a SAM point-segmentation result image from SAM_output/point_results/."""
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    safe = os.path.normpath(filename)
+    if safe.startswith("..") or safe.startswith("/"):
+        raise HTTPException(400, "Invalid filename")
+
+    result_dir = DATA_DIR / project_name / "SAM_output" / "point_results"
+    file_path = result_dir / safe
+    if not file_path.is_file():
+        raise HTTPException(404, f"Result image not found: {filename}")
+
+    ext = file_path.suffix.lower()
+    media_map = {
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".png": "image/png",
+    }
+    return FileResponse(file_path, media_type=media_map.get(ext, "image/png"))
+
+
+@app.post("/api/projects/{project_name}/sam/points/save")
+async def save_sam_points(project_name: str, stem: str = Form(...), points: str = Form(...)):
+    """Persist point-click markers so they survive app restarts.
+
+    points: JSON string like "[[800,600,1],[700,500,0]]"
+    """
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    point_dir = DATA_DIR / project_name / "SAM_output" / "point_results"
+    point_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_stem = os.path.basename(stem)
+    json_path = point_dir / f"{safe_stem}_points.json"
+
+    # Validate JSON
+    try:
+        pt_list = json.loads(points)
+        if not isinstance(pt_list, list):
+            raise ValueError("points must be a list")
+    except Exception as e:
+        raise HTTPException(400, f"Invalid points JSON: {e}")
+
+    json_path.write_text(json.dumps(pt_list, ensure_ascii=False), encoding="utf-8")
+    return {"success": True, "stem": safe_stem, "count": len(pt_list)}
+
+
+@app.get("/api/projects/{project_name}/sam/points/load/{stem}")
+async def load_sam_points(project_name: str, stem: str):
+    """Load persisted point-click markers for an image."""
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    safe_stem = os.path.basename(stem)
+    if safe_stem.startswith("..") or safe_stem.startswith("/"):
+        raise HTTPException(400, "Invalid stem")
+
+    json_path = DATA_DIR / project_name / "SAM_output" / "point_results" / f"{safe_stem}_points.json"
+    if not json_path.is_file():
+        return {"points": []}
+
+    try:
+        pts = json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"points": []}
+
+    return {"points": pts}
 
 
 @app.post("/api/projects/{project_name}/sam/run")
