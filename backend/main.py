@@ -788,13 +788,24 @@ async def run_mvs_pipeline(
 
 
 @app.get("/api/projects/{project_name}/mvs/log")
-async def get_mvs_log(project_name: str, lines: int = 100):
-    """Get MVS pipeline log."""
+async def get_mvs_log(project_name: str, lines: int = 100,
+                      mvs_type: str = "openmvs"):
+    """Get MVS pipeline log.
+
+    Query params:
+        mvs_type: MVS type (\"colmap\" or \"openmvs\", default \"openmvs\").
+            - openmvs: reads MVS_output/openmvs/mvs_pipeline.log
+            - colmap: reads SFM_output/pipeline.log (COLMAP MVS uses SfM log)
+    """
     p = get_project(project_name)
     if p is None:
         raise HTTPException(404, "Project not found")
 
-    log_path = _mvs_output_dir(project_name) / "mvs_pipeline.log"
+    if mvs_type == "colmap":
+        log_path = _sfm_output_dir(project_name) / "pipeline.log"
+    else:
+        log_path = _mvs_output_dir(project_name, mvs_type) / "mvs_pipeline.log"
+
     if not log_path.exists():
         return {"project_name": project_name, "log": "(no log yet)"}
 
@@ -842,17 +853,23 @@ async def get_mvs_result(project_name: str):
 
 
 @app.get("/api/projects/{project_name}/mvs/download/{filename:path}")
-async def download_mvs_file(project_name: str, filename: str):
-    """Download a result file from MVS_output directory."""
+async def download_mvs_file(project_name: str, filename: str,
+                            mvs_type: str = ""):
+    """Download a result file from MVS_output directory.
+
+    Query params:
+        mvs_type: Optional MVS type (\"colmap\" or \"openmvs\"). If not
+            given, searches all MVS subdirectories.
+    """
     p = get_project(project_name)
     if p is None:
         raise HTTPException(404, "Project not found")
 
-    mvs_dir = _mvs_output_dir(project_name)
     safe_path = os.path.normpath(filename)
     if safe_path.startswith("..") or safe_path.startswith("/"):
         raise HTTPException(400, "Invalid filename")
 
+    mvs_dir = _mvs_output_dir(project_name, mvs_type)
     file_path = mvs_dir / safe_path
     if not file_path.exists():
         raise HTTPException(404, f"File not found: {filename}")
