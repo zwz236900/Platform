@@ -53,7 +53,14 @@ def run(
                 "num_points_after": 0, "error": f"Project not found: {project}"}
 
     # Resolve paths (default to undistorted sparse + MVS dense)
-    ply_file = Path(ply_path or (project / "MVS_output" / "scene_dense.ply"))
+    # Check both colmap and openmvs subdirectories
+    _default_ply = project / "MVS_output" / "colmap" / "fused.ply"
+    if not _default_ply.exists():
+        _default_ply = project / "MVS_output" / "openmvs" / "scene_dense_mesh.ply"
+    if not _default_ply.exists():
+        _default_ply = project / "MVS_output" / "scene_dense.ply"  # legacy
+
+    ply_file = Path(ply_path or _default_ply)
     sparse = Path(sparse_dir or (project / "SFM_output" / "undistorted" / "sparse"))
     sam = Path(sam_dir or (project / "SAM_output"))
     out = Path(output_path or (project / "algorithm_output" / "filtered_scene.ply"))

@@ -39,12 +39,14 @@ def build_sfm_command(
     reconstruction_name: str = "0",
     vocab_tree_path: str | None = None,
     convert_output_suffix: str = "txt",
+    mvs_type: str = "colmap",
 ) -> list[str]:
     """Build the docker exec command to run sfm_cli.py inside the container.
 
     Project layout inside container:
         /data/<project>/Input/input_image/   →  --image_dir
         /data/<project>/SFM_output/          →  --output_dir
+        /data/<project>/MVS_output/<type>/   →  --dense_dir (when mvs in steps)
     """
     image_dir = DATA_DIR_CONTAINER / project_name / "Input" / "input_image"
     output_dir = DATA_DIR_CONTAINER / project_name / "SFM_output"
@@ -66,6 +68,11 @@ def build_sfm_command(
         "--reconstruction_name", reconstruction_name,
         "--no_clean",
     ]
+
+    # If mvs step is included, redirect dense output to MVS_output/<type>/
+    if steps and any(s in ("mvs", "fusion") for s in steps):
+        dense_dir = DATA_DIR_CONTAINER / project_name / "MVS_output" / mvs_type
+        cmd += ["--dense_dir", str(dense_dir)]
 
     if convert_output_suffix:
         cmd += ["--convert_output_suffix", convert_output_suffix]

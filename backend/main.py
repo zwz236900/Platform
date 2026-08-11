@@ -31,6 +31,7 @@ from modules.models import (
     MatcherType,
     MVSCommand,
     MVSConfig,
+    MVSType,
     PipelineConfig,
     PipelineStep,
     TaskStatus,
@@ -149,6 +150,7 @@ def _start_pipeline(project_name: str) -> None:
         reconstruction_name=config_dict.get("reconstruction_name", "0"),
         vocab_tree_path=config_dict.get("vocab_tree_path"),
         convert_output_suffix=config_dict.get("convert_output_suffix", "txt"),
+        mvs_type=config_dict.get("mvs_type", "colmap"),
     )
 
     logger.info("Project %r starting pipeline: %s", project_name, " ".join(cmd))
@@ -443,6 +445,7 @@ async def run_pipeline(
     no_geom_consistency: bool = Form(default=False),
     reconstruction_name: str = Form(default="0"),
     convert_output_suffix: str = Form(default="txt"),
+    mvs_type: str = Form(default="colmap"),
 ):
     """Configure and run the SfM pipeline for a project."""
     p = get_project(project_name)
@@ -462,8 +465,13 @@ async def run_pipeline(
         if s not in {ps.value for ps in PipelineStep}:
             raise HTTPException(400, f"Invalid step: {s}")
 
+    # Validate mvs_type
+    if mvs_type not in {m.value for m in MVSType}:
+        raise HTTPException(400, f"Invalid mvs_type: {mvs_type}. Choices: {[m.value for m in MVSType]}")
+
     config = PipelineConfig(
         steps=step_list,
+        mvs_type=MVSType(mvs_type),
         matcher=MatcherType(matcher),
         camera_model=CameraModel(camera_model),
         single_camera=single_camera,
@@ -678,6 +686,7 @@ def _check_mvs_completion(project_name: str) -> None:
 @app.post("/api/projects/{project_name}/mvs/run")
 async def run_mvs_pipeline(
     project_name: str,
+    mvs_type: str = Form(default="openmvs"),
     command: str = Form(default="pipeline"),
     model: str = Form(default="0"),
     resolution_level: int = Form(default=1),
@@ -691,10 +700,40 @@ async def run_mvs_pipeline(
     texture_resolution: int = Form(default=1),
     export_type: str = Form(default="ply"),
 ):
-    """Run an OpenMVS pipeline step for a project."""
+    """Run an MVS pipeline step (COLMAP or OpenMVS) for a project."""
     p = get_project(project_name)
     if p is None:
         raise HTTPException(404, "Project not found")
+
+    # Validate mvs_type
+    if mvs_type not in {m.value for m in MVSType}:
+        raise HTTPException(400, f"Invalid mvs_type: {mvs_type}. Choices: {[m.value for m in MVSType]}")
+
+    if mvs_type == "colmap":
+        # --- COLMAP MVS ---
+        if is_process_running(project_name):
+            raise HTTPException(400, "COLMAP pipeline is already running")
+
+        from modules.docker_runner import build_sfm_command, run_pipeline_async as run_colmap_async
+        # Run undistort + mvs: undistort sets up workspace at dense_dir,
+        # then mvs (patch_match_stereo + fusion) runs on it.
+        cmd = build_sfm_command(
+            project_name,
+            steps=["undistort", "mvs"],
+            use_gpu=not no_cuda,
+            gpu_index=0,
+            mvs_type="colmap",
+        )
+        logger.info("Project %r: starting COLMAP MVS", project_name)
+        update_project(project_name, status=TaskStatus.RUNNING.value)
+        await asyncio.to_thread(run_colmap_async, project_name, cmd)
+        return {
+            "success": True,
+            "message": f"COLMAP MVS started for {project_name}",
+            "data": {"mvs_type": "colmap"},
+        }
+
+    # --- OpenMVS ---
     if is_mvs_running(project_name):
         raise HTTPException(400, "MVS pipeline is already running")
 
@@ -706,6 +745,7 @@ async def run_mvs_pipeline(
         raise HTTPException(400, "export_type must be 'ply' or 'obj'")
 
     config = MVSConfig(
+        mvs_type=MVSType(mvs_type),
         command=MVSCommand(command),
         model=model,
         resolution_level=resolution_level,
@@ -737,13 +777,13 @@ async def run_mvs_pipeline(
         export_type=export_type,
     )
 
-    logger.info("Project %r: starting MVS %s", project_name, command)
+    logger.info("Project %r: starting OpenMVS %s", project_name, command)
     await asyncio.to_thread(run_mvs_async, project_name, cmd)
 
     return {
         "success": True,
-        "message": f"MVS {command} started for {project_name}",
-        "data": {"command": command},
+        "message": f"OpenMVS {command} started for {project_name}",
+        "data": {"mvs_type": "openmvs", "command": command},
     }
 
 

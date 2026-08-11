@@ -46,6 +46,12 @@ class PipelineStep(str, Enum):
     CONVERT = "convert"
 
 
+class MVSType(str, Enum):
+    """Which MVS pipeline to use."""
+    COLMAP = "colmap"
+    OPENMVS = "openmvs"
+
+
 class MVSCommand(str, Enum):
     PIPELINE = "pipeline"
     INTERFACE = "interface"
@@ -67,6 +73,7 @@ class PipelineConfig(BaseModel):
                  PipelineStep.UNDISTORT, PipelineStep.MVS],
         description="Pipeline steps to run",
     )
+    mvs_type: MVSType = Field(default=MVSType.COLMAP, description="MVS pipeline for the 'mvs' step")
     matcher: MatcherType = Field(default=MatcherType.EXHAUSTIVE)
     camera_model: CameraModel = Field(default=CameraModel.SIMPLE_RADIAL)
     single_camera: bool = Field(default=True)
@@ -80,7 +87,8 @@ class PipelineConfig(BaseModel):
 
 
 class MVSConfig(BaseModel):
-    """Configuration for the OpenMVS pipeline."""
+    """Configuration for the MVS pipeline (COLMAP or OpenMVS)."""
+    mvs_type: MVSType = Field(default=MVSType.OPENMVS, description="MVS pipeline type")
     command: MVSCommand = Field(default=MVSCommand.PIPELINE)
     model: str = Field(default="0", description="SFM model name")
     resolution_level: int = Field(default=1, ge=1, description="Downsample level")

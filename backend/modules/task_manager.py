@@ -21,6 +21,7 @@ DATA_DIR = Path("/home/zwz/Code/DATA")
 
 # Pre-created output directories (mirrors existing convention)
 OUTPUT_DIRS = ["SFM_output", "MVS_output", "3DGS_output", "PoinTR_output", "SAM_output", "algorithm_output"]
+MVS_SUBDIRS = ["colmap", "openmvs"]
 
 
 # ---------------------------------------------------------------------------
@@ -52,13 +53,25 @@ def _result_json(project_name: str) -> Path:
     return _sfm_output_dir(project_name) / "pipeline_result.json"
 
 
-def _mvs_output_dir(project_name: str) -> Path:
-    return _project_dir(project_name) / "MVS_output"
+def _mvs_output_dir(project_name: str, mvs_type: str = "") -> Path:
+    """MVS output directory. If mvs_type given, returns the subdirectory."""
+    base = _project_dir(project_name) / "MVS_output"
+    if mvs_type:
+        return base / mvs_type
+    return base
 
 
-def _mvs_result_json(project_name: str) -> Path:
-    """Path to mvs_pipeline_result.json (inside MVS_output)."""
-    return _mvs_output_dir(project_name) / "mvs_pipeline_result.json"
+def _colmap_mvs_dir(project_name: str) -> Path:
+    return _mvs_output_dir(project_name, "colmap")
+
+
+def _openmvs_dir(project_name: str) -> Path:
+    return _mvs_output_dir(project_name, "openmvs")
+
+
+def _mvs_result_json(project_name: str, mvs_type: str = "") -> Path:
+    """Path to mvs_pipeline_result.json (inside MVS_output/<type>/)."""
+    return _mvs_output_dir(project_name, mvs_type) / "mvs_pipeline_result.json"
 
 
 def _log_path(project_name: str) -> Path:
@@ -77,6 +90,9 @@ def _scaffold_project(project_name: str) -> None:
     (base / "Input" / "input_video").mkdir(parents=True, exist_ok=True)
     for d in OUTPUT_DIRS:
         (base / d).mkdir(parents=True, exist_ok=True)
+    # MVS subdirectories
+    for sd in MVS_SUBDIRS:
+        (base / "MVS_output" / sd).mkdir(parents=True, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------

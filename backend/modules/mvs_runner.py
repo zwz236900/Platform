@@ -48,11 +48,11 @@ def build_mvs_command(
     """Build the docker exec command to run mvs_cli.py inside the openmvs container.
 
     Project layout inside container:
-        /data/<project>/SFM_output/   →  --sfm-dir
-        /data/<project>/MVS_output/   →  --output-dir
+        /data/<project>/SFM_output/                →  --sfm-dir
+        /data/<project>/MVS_output/openmvs/        →  --output-dir
     """
     sfm_dir = DATA_DIR_CONTAINER / project_name / "SFM_output"
-    output_dir = DATA_DIR_CONTAINER / project_name / "MVS_output"
+    output_dir = DATA_DIR_CONTAINER / project_name / "MVS_output" / "openmvs"
 
     cmd = [
         "docker", "exec", CONTAINER_NAME,
@@ -147,7 +147,7 @@ def run_mvs_async(
         _running_mvs_processes[project_name] = proc
 
         # Prepare log paths
-        mvs_log = DATA_DIR_HOST / project_name / "MVS_output" / "mvs_pipeline.log"
+        mvs_log = DATA_DIR_HOST / project_name / "MVS_output" / "openmvs" / "mvs_pipeline.log"
         mvs_log.parent.mkdir(parents=True, exist_ok=True)
 
         # Stream output to both log files in real time
