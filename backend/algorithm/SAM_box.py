@@ -35,7 +35,7 @@ def get_processor(checkpoint: str = "/workspace/model/sam3.pt", device: str = "c
     from sam3.model.sam3_image_processor import Sam3Processor
 
     model = build_sam3_image_model(checkpoint_path=checkpoint, device=device, eval_mode=True)
-    _processor = Sam3Processor(model, resolution=1008, confidence_threshold=0.3)
+    _processor = Sam3Processor(model, resolution=1008, confidence_threshold=0.5)
     print("SAM model loaded.", file=sys.stderr)
     return _processor
 
@@ -96,56 +96,103 @@ def segment_with_box(
         with torch.autocast(device, dtype=torch.bfloat16):
             state = processor.add_geometric_prompt(box=box_norm, label=True, state=state)
 
-        # Extract masks — could be list of tensors or a single batched tensor
-        masks = state.get("masks", None)
+        # Extract best mask — prefer soft logits for smoother edges.
+        # masks_logits: float in [0, 1] before binarization; masks: binary at threshold 0.5.
+        masks_soft = state.get("masks_logits", None)  # soft mask, preferred
+        masks = state.get("masks", None)  # binary mask, fallback
         scores = state.get("scores", [])
 
-        if masks is None:
+        if masks_soft is None and masks is None:
             return {"success": False, "error": "Model returned no masks"}
 
-        # Handle tensor masks: shape [N, 1, H, W] or [N, H, W]
-        if isinstance(masks, torch.Tensor):
-            n_masks = masks.shape[0] if masks.dim() >= 3 else 1
-            if n_masks == 0:
-                return {"success": False, "error": "Model returned no masks"}
-            best_idx = 0
+        def _pick_best_idx(n: int) -> int:
+            """Pick the best mask index from scores."""
             if isinstance(scores, torch.Tensor) and scores.numel() > 0:
-                best_idx = int(torch.argmax(scores).item())
-            elif isinstance(scores, list) and len(scores) > 0:
-                scores_np = np.array([s.item() if hasattr(s, "item") else float(s) for s in scores])
-                best_idx = int(np.argmax(scores_np))
-            mask_tensor = masks[best_idx]
-            mask_np = mask_tensor.cpu().numpy().squeeze()
-        elif isinstance(masks, list):
-            if len(masks) == 0:
-                return {"success": False, "error": "Model returned no masks"}
-            best_idx = 0
-            if len(scores) > 0:
-                scores_np = np.array([s.item() if hasattr(s, "item") else float(s) for s in scores])
-                best_idx = int(np.argmax(scores_np))
-            mask_np = masks[best_idx].cpu().numpy().squeeze() if isinstance(masks[best_idx], torch.Tensor) else np.array(masks[best_idx]).squeeze()
+                return int(torch.argmax(scores).item())
+            if isinstance(scores, list) and len(scores) > 0:
+                arr = np.array([s.item() if hasattr(s, "item") else float(s) for s in scores])
+                return int(np.argmax(arr))
+            return 0
+
+        def _tensor_to_np(t: torch.Tensor, idx: int) -> np.ndarray:
+            return t[idx].cpu().numpy().squeeze()
+
+        # Extract the best soft mask (float32, [0, 1])
+        if masks_soft is not None:
+            if isinstance(masks_soft, torch.Tensor):
+                n = masks_soft.shape[0] if masks_soft.dim() >= 3 else 1
+                if n == 0:
+                    return {"success": False, "error": "Model returned no masks"}
+                best_idx = _pick_best_idx(n)
+                soft_np = _tensor_to_np(masks_soft, best_idx)
+            elif isinstance(masks_soft, list):
+                if len(masks_soft) == 0:
+                    return {"success": False, "error": "Model returned no masks"}
+                best_idx = _pick_best_idx(len(masks_soft))
+                item = masks_soft[best_idx]
+                soft_np = item.cpu().numpy().squeeze() if isinstance(item, torch.Tensor) else np.array(item).squeeze()
+            else:
+                return {"success": False, "error": f"Unexpected masks_logits type: {type(masks_soft)}"}
         else:
-            return {"success": False, "error": f"Unexpected mask type: {type(masks)}"}
+            # Fallback to binary mask
+            if isinstance(masks, torch.Tensor):
+                n = masks.shape[0] if masks.dim() >= 3 else 1
+                if n == 0:
+                    return {"success": False, "error": "Model returned no masks"}
+                best_idx = _pick_best_idx(n)
+                soft_np = _tensor_to_np(masks, best_idx).astype(np.float32)
+            elif isinstance(masks, list):
+                if len(masks) == 0:
+                    return {"success": False, "error": "Model returned no masks"}
+                best_idx = _pick_best_idx(len(masks))
+                item = masks[best_idx]
+                bin_np = item.cpu().numpy().squeeze() if isinstance(item, torch.Tensor) else np.array(item).squeeze()
+                soft_np = bin_np.astype(np.float32)
+            else:
+                return {"success": False, "error": f"Unexpected mask type: {type(masks)}"}
 
-        # Save mask as PNG
-        mask_uint8 = (mask_np.astype(np.uint8)) * 255
-        mask_path = out_dir / f"{stem}_mask.png"
-        Image.fromarray(mask_uint8).save(str(mask_path))
-
-        # Save overlay (original + green mask highlight)
         img_np = np.array(pil_image)  # [H, W, 3] RGB
-        overlay = img_np.copy()
-        mask_3c = mask_np[:, :, None].astype(np.float32)
-        overlay = (overlay * (1 - 0.5 * mask_3c) + np.array([0, 255, 0]) * 0.5 * mask_3c).astype(np.uint8)
+
+        # --- Binary mask PNG (for precise mask extraction) ---
+        mask_bin = (soft_np >= 0.5).astype(np.uint8) * 255
+        mask_path = out_dir / f"{stem}_mask.png"
+        Image.fromarray(mask_bin).save(str(mask_path))
+
+        # --- Soft mask overlay (smooth edges, green highlight) ---
+        soft_3c = soft_np[:, :, None].astype(np.float32)
+        green = np.array([0, 220, 40], dtype=np.float32)
+        alpha = 0.45 * soft_3c
+        overlay = (img_np.astype(np.float32) * (1 - alpha) + green * alpha).clip(0, 255).astype(np.uint8)
         overlay_path = out_dir / f"{stem}_overlay.png"
         Image.fromarray(overlay).save(str(overlay_path))
+
+        # --- Contour overlay (outline + soft fill for clarity) ---
+        from scipy import ndimage
+        struct = ndimage.generate_binary_structure(2, 2)
+        eroded = ndimage.binary_erosion(soft_np >= 0.5, structure=struct, iterations=2)
+        contour = (soft_np >= 0.5) & ~eroded
+        # Draw contour in bright green
+        contour_overlay = img_np.copy()
+        contour_overlay[contour] = [0, 255, 0]
+        contour_path = out_dir / f"{stem}_contour.png"
+        Image.fromarray(contour_overlay).save(str(contour_path))
+
+        # Compute per-mask scores for debug
+        if isinstance(scores, torch.Tensor) and scores.numel() > 0:
+            best_score = float(scores[best_idx].item())
+        elif isinstance(scores, list) and len(scores) > best_idx:
+            s = scores[best_idx]
+            best_score = float(s.item()) if hasattr(s, "item") else float(s)
+        else:
+            best_score = None
 
         return {
             "success": True,
             "mask_path": str(mask_path),
             "overlay_path": str(overlay_path),
+            "contour_path": str(contour_path),
             "box": [int(x1), int(y1), int(x2), int(y2)],
-            "score": float(scores[best_idx].item()) if isinstance(scores, torch.Tensor) and scores.numel() > 0 else (float(scores[best_idx]) if isinstance(scores, list) and len(scores) > best_idx else None),
+            "score": best_score,
         }
 
     except Exception as e:

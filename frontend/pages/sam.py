@@ -1,4 +1,4 @@
-"""SAM 分割页面 — 框选分割 + 语义分割."""
+"""SAM 分割页面 — 框选分割 + 点选分割 + 语义分割."""
 
 from __future__ import annotations
 
@@ -257,6 +257,74 @@ class ImageCanvas(QLabel):
             bottom_right = self._image_to_widget(r.bottomRight())
             painter.drawRect(QRect(top_left, bottom_right).normalized())
             painter.end()
+
+
+# ---------------------------------------------------------------------------
+# 点选分割 — 点击式画布
+# ---------------------------------------------------------------------------
+
+class PointCanvas(ImageCanvas):
+    """支持点选交互的图片显示控件 — 单击选择目标，无需画框。"""
+
+    point_clicked = Signal(int, int)  # x, y (图像坐标)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(interactive=True, parent=parent)
+        self._point_marker: QPoint | None = None  # 图像坐标的点击位置
+
+    def set_point_marker(self, x: int, y: int):
+        """设置点击位置标记（蓝色十字）。"""
+        self._point_marker = QPoint(x, y)
+        self.update()
+
+    def clear_point(self):
+        self._point_marker = None
+        self.update()
+
+    # ------------------------------------------------------------------
+    # 鼠标事件 — 点选模式（不画框）
+    # ------------------------------------------------------------------
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if self._interactive and event.button() == Qt.LeftButton and self._pixmap:
+            img_pos = self._widget_to_image(event.pos())
+            self.set_point_marker(img_pos.x(), img_pos.y())
+            self.point_clicked.emit(img_pos.x(), img_pos.y())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    # ------------------------------------------------------------------
+    # 绘制 — 蓝色十字标记 + 可选预览遮罩
+    # ------------------------------------------------------------------
+
+    def paintEvent(self, event: QPaintEvent):
+        super().paintEvent(event)
+        if not self._pixmap or self._pixmap.isNull():
+            return
+
+        painter = QPainter(self)
+
+        # 绘制点击位置十字标记
+        if self._point_marker:
+            widget_pos = self._image_to_widget(self._point_marker)
+            pen = QPen(QColor("#58a6ff"), 2, Qt.SolidLine)
+            painter.setPen(pen)
+            # 水平线
+            painter.drawLine(
+                widget_pos.x() - 12, widget_pos.y(),
+                widget_pos.x() + 12, widget_pos.y(),
+            )
+            # 竖直线
+            painter.drawLine(
+                widget_pos.x(), widget_pos.y() - 12,
+                widget_pos.x(), widget_pos.y() + 12,
+            )
+            # 外圈
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(widget_pos, 8, 8)
+
+        painter.end()
 
 
 # ---------------------------------------------------------------------------
@@ -640,20 +708,25 @@ class BoxSelectionPanel(QWidget):
             else:
                 resp_data = payload.get("data", {})
                 overlay_path = resp_data.get("overlay_path", "")
+                contour_path = resp_data.get("contour_path", "")
                 box = resp_data.get("box", [])
+                score = resp_data.get("score")
                 self._log_msg(
                     f"✓ 分割完成 → {Path(overlay_path).name}"
                     if overlay_path else "✓ 分割完成"
                 )
-                self._status_label.setText("✓ 分割完成")
+                if score is not None:
+                    self._status_label.setText(f"✓ 分割完成 (置信度: {score:.2f})")
+                else:
+                    self._status_label.setText("✓ 分割完成")
                 # 缓存当前框并设为后续默认
                 cur_box = self._left_canvas.current_box()
                 if self._current_idx >= 0:
                     self._box_cache[self._current_idx] = cur_box
                 self._last_segmented_box = cur_box
-                # 加载结果图
-                if overlay_path:
-                    result_filename = Path(overlay_path).name
+                # 加载结果图 — 优先显示轮廓图（更清晰）
+                if contour_path:
+                    result_filename = Path(contour_path).name
                     self._api.fetch_image(
                         f"/api/projects/{self._project}/sam/box-result/{result_filename}",
                         tag="box_right_image",
@@ -667,6 +740,416 @@ class BoxSelectionPanel(QWidget):
                 pix.loadFromData(image_data)
                 self._right_canvas.set_image(pix)
                 # 缓存结果图，切换图片后再切回来时保留
+                if self._current_idx >= 0:
+                    self._result_cache[self._current_idx] = pix
+
+    # ------------------------------------------------------------------
+    # 辅助
+    # ------------------------------------------------------------------
+
+    def _log_msg(self, text: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._log.append(f"[{ts}] {text}")
+
+
+# ---------------------------------------------------------------------------
+# 点选分割面板
+# ---------------------------------------------------------------------------
+
+class PointSelectionPanel(QWidget):
+    """点选分割 — 单击图片上的目标物体，SAM3 自动分割。"""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._api = SamApiClient.instance()
+        self._api.finished.connect(self._on_response)
+
+        # 状态
+        self._project: str = ""
+        self._images: list[str] = []
+        self._current_idx: int = -1
+        self._model_loaded: bool = False
+        self._point_cache: dict[int, tuple[int, int]] = {}
+        self._result_cache: dict[int, QPixmap] = {}
+        self._last_segmented_point: tuple[int, int] | None = None
+
+        # ── 布局 ──
+        layout = QVBoxLayout(self)
+
+        # 项目行
+        proj_row = QHBoxLayout()
+        proj_row.addWidget(QLabel("项目:"))
+        self._proj_combo = QComboBox()
+        self._proj_combo.setMinimumWidth(160)
+        self._proj_combo.setObjectName("projectCombo")
+        self._proj_combo.currentTextChanged.connect(self._on_project_changed)
+        proj_row.addWidget(self._proj_combo)
+
+        self._refresh_proj_btn = QPushButton("🔄")
+        self._refresh_proj_btn.setObjectName("actionBtn")
+        self._refresh_proj_btn.setToolTip("刷新项目列表")
+        self._refresh_proj_btn.clicked.connect(self._load_projects)
+        proj_row.addWidget(self._refresh_proj_btn)
+
+        proj_row.addWidget(QLabel("  第"))
+        self._page_spin = QSpinBox()
+        self._page_spin.setMinimum(1)
+        self._page_spin.setFixedWidth(60)
+        self._page_spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self._page_spin.setEnabled(False)
+        self._page_spin.valueChanged.connect(self._on_page_spin)
+        proj_row.addWidget(self._page_spin)
+        self._total_label = QLabel("张")
+        proj_row.addWidget(self._total_label)
+        proj_row.addStretch()
+        layout.addLayout(proj_row)
+
+        # 控制行
+        ctrl_row = QHBoxLayout()
+        self._load_model_btn = QPushButton("🚀 加载 SAM 模型")
+        self._load_model_btn.setObjectName("primaryBtn")
+        self._load_model_btn.clicked.connect(self._on_load_model)
+        ctrl_row.addWidget(self._load_model_btn)
+
+        self._segment_btn = QPushButton("🖱 分割")
+        self._segment_btn.setObjectName("primaryBtn")
+        self._segment_btn.setEnabled(False)
+        self._segment_btn.clicked.connect(self._on_segment)
+        ctrl_row.addWidget(self._segment_btn)
+
+        ctrl_row.addStretch()
+        self._point_info_label = QLabel("")
+        self._point_info_label.setStyleSheet("color:#8b949e; font-size:12px;")
+        ctrl_row.addWidget(self._point_info_label)
+        self._status_label = QLabel("就绪")
+        self._status_label.setStyleSheet("color:#8b949e; font-size:12px;")
+        ctrl_row.addWidget(self._status_label)
+        layout.addLayout(ctrl_row)
+
+        # 双图区域
+        splitter = QSplitter(Qt.Horizontal)
+
+        # 左图 — 点选交互
+        left_container = QWidget()
+        left_layout = QVBoxLayout(left_container)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_header = QLabel("原图（单击目标物体 · ↑↓ 键切换）")
+        left_header.setStyleSheet("color:#8b949e; font-size:12px; padding:4px;")
+        left_layout.addWidget(left_header)
+        self._left_canvas = PointCanvas()
+        self._left_canvas.point_clicked.connect(self._on_point_clicked)
+        self._left_canvas.setFocusPolicy(Qt.StrongFocus)
+        self._left_canvas.installEventFilter(self)
+        left_layout.addWidget(self._left_canvas, 1)
+        splitter.addWidget(left_container)
+
+        # 右图 — 分割结果
+        right_container = QWidget()
+        right_layout = QVBoxLayout(right_container)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_header = QLabel("分割结果")
+        right_header.setStyleSheet("color:#8b949e; font-size:12px; padding:4px;")
+        right_layout.addWidget(right_header)
+        self._right_canvas = ImageCanvas(interactive=False)
+        right_layout.addWidget(self._right_canvas, 1)
+        splitter.addWidget(right_container)
+
+        splitter.setSizes([400, 400])
+        layout.addWidget(splitter, 1)
+
+        # 导航行
+        nav_row = QHBoxLayout()
+        nav_row.addStretch()
+        self._prev_btn = QPushButton("◀ 上一张")
+        self._prev_btn.setObjectName("actionBtn")
+        self._prev_btn.clicked.connect(self._prev_image)
+        nav_row.addWidget(self._prev_btn)
+        self._next_btn = QPushButton("下一张 ▶")
+        self._next_btn.setObjectName("actionBtn")
+        self._next_btn.clicked.connect(self._next_image)
+        nav_row.addWidget(self._next_btn)
+        layout.addLayout(nav_row)
+
+        # 日志
+        self._log = QTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setObjectName("logArea")
+        self._log.setMaximumHeight(100)
+        self._log.setFont(QFont("Consolas", 9))
+        layout.addWidget(self._log)
+
+        # 启动
+        self._load_projects()
+
+    # ------------------------------------------------------------------
+    # 键盘导航
+    # ------------------------------------------------------------------
+
+    def eventFilter(self, obj, event):
+        if obj is self._left_canvas and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            if key in (Qt.Key_Up, Qt.Key_Left):
+                self._prev_image()
+                return True
+            elif key in (Qt.Key_Down, Qt.Key_Right):
+                self._next_image()
+                return True
+        return super().eventFilter(obj, event)
+
+    # ------------------------------------------------------------------
+    # 数据加载
+    # ------------------------------------------------------------------
+
+    def _load_projects(self):
+        self._refresh_proj_btn.setEnabled(False)
+        self._api.get("/api/projects", tag="point_list_projects")
+
+    def _on_project_changed(self, project: str):
+        if not project or project == self._project:
+            return
+        self._project = project
+        self._images.clear()
+        self._point_cache.clear()
+        self._result_cache.clear()
+        self._last_segmented_point = None
+        self._current_idx = -1
+        self._left_canvas.set_image(QPixmap())
+        self._left_canvas.clear_point()
+        self._right_canvas.set_image(QPixmap())
+        self._page_spin.setEnabled(False)
+        self._total_label.setText("张")
+        self._point_info_label.setText("")
+        self._status_label.setText("加载图片列表中...")
+        self._log_msg(f"切换项目: {project}")
+        self._api.get(f"/api/projects/{project}/images/list", tag="point_list_images")
+
+    def _on_page_spin(self, num: int):
+        idx = num - 1
+        if 0 <= idx < len(self._images):
+            self._goto_image(idx)
+
+    def _prev_image(self):
+        self._goto_image(self._current_idx - 1)
+
+    def _next_image(self):
+        self._goto_image(self._current_idx + 1)
+
+    def _goto_image(self, idx: int):
+        if idx < 0 or idx >= len(self._images):
+            return
+
+        # 保存当前状态
+        if self._current_idx >= 0:
+            if self._left_canvas._point_marker:
+                self._point_cache[self._current_idx] = (
+                    self._left_canvas._point_marker.x(),
+                    self._left_canvas._point_marker.y(),
+                )
+
+        self._current_idx = idx
+        self._page_spin.blockSignals(True)
+        self._page_spin.setValue(idx + 1)
+        self._page_spin.blockSignals(False)
+        self._total_label.setText(f"/ {len(self._images)} 张")
+
+        # 恢复左图点击标记
+        if idx in self._point_cache:
+            px, py = self._point_cache[idx]
+            self._left_canvas.set_point_marker(px, py)
+            self._point_info_label.setText(f"点击: ({px}, {py})")
+        elif self._last_segmented_point:
+            px, py = self._last_segmented_point
+            self._left_canvas.set_point_marker(px, py)
+            self._point_info_label.setText(f"点击: ({px}, {py})")
+        else:
+            self._left_canvas.clear_point()
+            self._point_info_label.setText("单击物体进行分割")
+
+        # 恢复右图结果
+        if idx in self._result_cache:
+            self._right_canvas.set_image(self._result_cache[idx])
+        else:
+            self._right_canvas.set_image(QPixmap())
+
+        self._load_current_image()
+
+    def _load_current_image(self):
+        if self._current_idx < 0 or self._current_idx >= len(self._images):
+            return
+        fname = self._images[self._current_idx]
+        self._api.fetch_image(
+            f"/api/projects/{self._project}/images/view/{fname}",
+            tag="point_left_image",
+        )
+
+    # ------------------------------------------------------------------
+    # 点选交互
+    # ------------------------------------------------------------------
+
+    def _on_point_clicked(self, x: int, y: int):
+        """左图画布点击 → 自动触发点选分割。"""
+        self._point_info_label.setText(f"点击: ({x}, {y})")
+
+        # 如果模型未加载，先提示
+        if not self._model_loaded:
+            self._log_msg("⚠ 请先加载 SAM 模型")
+            self._status_label.setText("请先加载模型")
+            return
+
+        self._do_segment(x, y)
+
+    def _do_segment(self, x: int, y: int):
+        """执行点选分割请求。"""
+        if not self._project or self._current_idx < 0:
+            return
+
+        fname = self._images[self._current_idx]
+        self._segment_btn.setEnabled(False)
+        self._segment_btn.setText("⏳ 推理中...")
+        self._status_label.setText("SAM 推理中...")
+        self._log_msg(f"点选分割: {fname} @ ({x}, {y})")
+
+        self._api.post(
+            f"/api/projects/{self._project}/sam/point-segment",
+            form_data={"filename": fname, "x": str(x), "y": str(y)},
+            tag="point_segment",
+        )
+
+    def _on_segment(self):
+        """按钮触发的分割 — 使用当前点击位置。"""
+        if not self._left_canvas._point_marker:
+            self._log_msg("⚠ 请先在图片上点击目标物体")
+            return
+        x = self._left_canvas._point_marker.x()
+        y = self._left_canvas._point_marker.y()
+        self._do_segment(x, y)
+
+    def _on_load_model(self):
+        self._load_model_btn.setEnabled(False)
+        self._load_model_btn.setText("⏳ 启动容器...")
+        self._status_label.setText("正在启动 sam3 容器并加载模型...")
+        self._log_msg("正在启动 sam3 容器并加载模型到 GPU...")
+        self._api.post(
+            f"/api/projects/{self._project}/sam/warmup",
+            form_data={},
+            tag="point_warmup",
+        )
+
+    # ------------------------------------------------------------------
+    # 响应分发
+    # ------------------------------------------------------------------
+
+    def _on_response(self, method: str, path: str, payload: dict):
+        tag = payload.get("_tag", "")
+        error = payload.get("_error")
+
+        # ── 项目列表 ──
+        if tag == "point_list_projects":
+            self._refresh_proj_btn.setEnabled(True)
+            if error:
+                self._log_msg(f"✗ 获取项目失败: {error}")
+                return
+            projects = payload.get("projects", [])
+            current = self._proj_combo.currentText()
+            self._proj_combo.blockSignals(True)
+            self._proj_combo.clear()
+            for p in projects:
+                self._proj_combo.addItem(p.get("name", p.get("project_name", "")))
+            if current:
+                idx = self._proj_combo.findText(current)
+                if idx >= 0:
+                    self._proj_combo.setCurrentIndex(idx)
+            self._proj_combo.blockSignals(False)
+            self._log_msg(f"✓ 加载了 {len(projects)} 个项目")
+
+        # ── 图片列表 ──
+        elif tag == "point_list_images":
+            if error:
+                self._log_msg(f"✗ 获取图片失败: {error}")
+                return
+            self._images = payload.get("images", [])
+            self._point_cache.clear()
+            self._result_cache.clear()
+            self._last_segmented_point = None
+            self._page_spin.setMaximum(max(1, len(self._images)))
+            self._page_spin.setEnabled(len(self._images) > 0)
+            self._log_msg(f"✓ 共 {len(self._images)} 张图片")
+            if self._images:
+                self._goto_image(0)
+            else:
+                self._left_canvas.set_image(QPixmap())
+                self._right_canvas.set_image(QPixmap())
+                self._total_label.setText("/ 0 张")
+
+        # ── 左图 ──
+        elif tag == "point_left_image":
+            image_data = payload.get("_image_data")
+            if image_data:
+                pix = QPixmap()
+                pix.loadFromData(image_data)
+                self._left_canvas.set_image(pix)
+                self._status_label.setText(
+                    f"图片 {self._current_idx + 1}/{len(self._images)}"
+                )
+                if self._model_loaded:
+                    self._segment_btn.setEnabled(True)
+
+        # ── 模型加载 ──
+        elif tag == "point_warmup":
+            self._load_model_btn.setEnabled(True)
+            if error:
+                self._log_msg(f"✗ 模型加载失败: {error}")
+                self._status_label.setText("模型加载失败")
+                QMessageBox.warning(self, "加载失败", str(error))
+            else:
+                self._load_model_btn.setText("✅ SAM 已就绪")
+                self._model_loaded = True
+                self._segment_btn.setEnabled(True)
+                self._log_msg("✓ SAM 模型已加载到 GPU")
+                self._status_label.setText("SAM 就绪，请点击图片上的目标物体")
+
+        # ── 分割结果 ──
+        elif tag == "point_segment":
+            self._segment_btn.setEnabled(True)
+            self._segment_btn.setText("🖱 分割")
+            if error:
+                self._log_msg(f"✗ 分割失败: {error}")
+                self._status_label.setText("分割失败")
+                QMessageBox.warning(self, "分割失败", str(error))
+            else:
+                resp_data = payload.get("data", {})
+                contour_path = resp_data.get("contour_path", "")
+                point = resp_data.get("point", [])
+                score = resp_data.get("score")
+                overlay_path = resp_data.get("overlay_path", "")
+                self._log_msg(
+                    f"✓ 分割完成 → {Path(overlay_path).name}"
+                    if overlay_path else "✓ 分割完成"
+                )
+                if score is not None:
+                    self._status_label.setText(f"✓ 分割完成 (置信度: {score:.2f})")
+                else:
+                    self._status_label.setText("✓ 分割完成")
+                # 缓存当前点击位置
+                cur_pt = self._left_canvas._point_marker
+                if cur_pt and self._current_idx >= 0:
+                    self._point_cache[self._current_idx] = (cur_pt.x(), cur_pt.y())
+                    self._last_segmented_point = (cur_pt.x(), cur_pt.y())
+                # 加载结果图 — 优先轮廓图
+                if contour_path:
+                    result_filename = Path(contour_path).name
+                    self._api.fetch_image(
+                        f"/api/projects/{self._project}/sam/box-result/{result_filename}",
+                        tag="point_right_image",
+                    )
+
+        # ── 右图（分割结果）──
+        elif tag == "point_right_image":
+            image_data = payload.get("_image_data")
+            if image_data:
+                pix = QPixmap()
+                pix.loadFromData(image_data)
+                self._right_canvas.set_image(pix)
                 if self._current_idx >= 0:
                     self._result_cache[self._current_idx] = pix
 
@@ -716,26 +1199,37 @@ class SAMPage(BasePage):
         self._box_btn.setMinimumHeight(32)
         self._btn_group.addButton(self._box_btn, 0)
 
+        self._point_btn = QPushButton("🖱 点选分割")
+        self._point_btn.setCheckable(True)
+        self._point_btn.setObjectName("actionBtn")
+        self._point_btn.setMinimumHeight(32)
+        self._btn_group.addButton(self._point_btn, 1)
+
         self._sem_btn = QPushButton("📝 语义分割")
         self._sem_btn.setCheckable(True)
         self._sem_btn.setObjectName("actionBtn")
         self._sem_btn.setMinimumHeight(32)
-        self._btn_group.addButton(self._sem_btn, 1)
+        self._btn_group.addButton(self._sem_btn, 2)
 
         nav.addWidget(self._box_btn)
+        nav.addWidget(self._point_btn)
         nav.addWidget(self._sem_btn)
         nav.addStretch()
         self.content_layout.addLayout(nav)
 
         self._box_panel = BoxSelectionPanel()
+        self._point_panel = PointSelectionPanel()
         self._sem_panel = SemanticPanel()
+        self._point_panel.setVisible(False)
         self._sem_panel.setVisible(False)
 
         self.content_layout.addWidget(self._box_panel, 1)
+        self.content_layout.addWidget(self._point_panel, 1)
         self.content_layout.addWidget(self._sem_panel, 1)
 
         self._btn_group.idClicked.connect(self._switch_panel)
 
     def _switch_panel(self, idx: int):
         self._box_panel.setVisible(idx == 0)
-        self._sem_panel.setVisible(idx == 1)
+        self._point_panel.setVisible(idx == 1)
+        self._sem_panel.setVisible(idx == 2)

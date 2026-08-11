@@ -667,11 +667,18 @@ async def _ensure_sam3_container() -> None:
 
 
 async def _setup_sam_script() -> None:
-    """Copy SAM_box.py into DATA_DIR if not already present."""
-    script_src = Path(__file__).parent / "algorithm" / "SAM_box.py"
-    script_dst = DATA_DIR / "sam_box.py"
-    if script_src.exists() and not script_dst.exists():
-        shutil.copy(script_src, script_dst)
+    """Copy SAM_box.py and SAM_point.py into DATA_DIR if not already present."""
+    algo_dir = Path(__file__).parent / "algorithm"
+
+    box_src = algo_dir / "SAM_box.py"
+    box_dst = DATA_DIR / "sam_box.py"
+    if box_src.exists() and not box_dst.exists():
+        shutil.copy(box_src, box_dst)
+
+    point_src = algo_dir / "SAM_point.py"
+    point_dst = DATA_DIR / "sam_point.py"
+    if point_src.exists() and not point_dst.exists():
+        shutil.copy(point_src, point_dst)
 
 
 # ---------------------------------------------------------------------------
@@ -755,7 +762,92 @@ async def sam_box_segment(
         "data": {
             "mask_path": result.get("mask_path"),
             "overlay_path": result.get("overlay_path"),
+            "contour_path": result.get("contour_path"),
             "box": result.get("box"),
+            "score": result.get("score"),
+        },
+    }
+
+
+@app.post("/api/projects/{project_name}/sam/point-segment")
+async def sam_point_segment(
+    project_name: str,
+    filename: str = Form(...),
+    x: int = Form(...),
+    y: int = Form(...),
+):
+    """Run SAM inference on a single image with a point prompt (click-to-segment).
+
+    Uses SAM3's interactive predict_inst() API — click on an object, model segments it.
+    Runs inside the sam3 container.
+    """
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    safe = os.path.normpath(filename)
+    if safe.startswith("..") or safe.startswith("/"):
+        raise HTTPException(400, "Invalid filename")
+
+    img_dir = _input_image_dir(project_name)
+    image_path = img_dir / safe
+    if not image_path.is_file():
+        raise HTTPException(404, f"Image not found: {filename}")
+
+    # Paths inside the container
+    container_image = f"/data/{project_name}/Input/input_image/{safe}"
+    container_output = f"/data/{project_name}/SAM_output/box_results"
+
+    await _setup_sam_script()
+    await _ensure_sam3_container()
+
+    cmd = [
+        "docker", "exec", "sam3",
+        "python3", "/data/sam_point.py",
+        "--image", container_image,
+        "--point", f"{x},{y}",
+        "--output", container_output,
+    ]
+
+    logger.info("Project %r: SAM point-segment on %s point=(%d,%d)",
+                project_name, safe, x, y)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=60,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(500, "SAM inference timed out (60s)")
+    except FileNotFoundError:
+        raise HTTPException(500, "Docker not available — is Docker running?")
+
+    if proc.returncode != 0:
+        err = stderr.decode() if stderr else "Unknown error"
+        logger.error("SAM point-segment failed: %s", err)
+        raise HTTPException(500, f"SAM inference failed: {err[:200]}")
+
+    try:
+        result = json.loads(stdout.decode())
+    except json.JSONDecodeError:
+        raise HTTPException(500, f"Invalid SAM output: {stdout.decode()[:200]}")
+
+    if not result.get("success"):
+        raise HTTPException(500, result.get("error", "SAM inference failed"))
+
+    return {
+        "success": True,
+        "message": "Point segmentation completed",
+        "data": {
+            "mask_path": result.get("mask_path"),
+            "overlay_path": result.get("overlay_path"),
+            "contour_path": result.get("contour_path"),
+            "point": result.get("point"),
+            "score": result.get("score"),
         },
     }
 
