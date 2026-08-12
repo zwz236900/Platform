@@ -836,6 +836,10 @@ class PointSelectionPanel(QWidget):
         self._batch_done: int = 0
         self._batch_mode: bool = False
         self._pending_points_idx: int = -1  # 等待图片加载完成后恢复标点的索引
+        self._disk_loaded: set[int] = set()  # 已从磁盘加载过标点的索引
+        # 区分手动/自动（继承）标注
+        self._is_manual: dict[int, bool] = {}  # idx -> 该图点是否为手动标注
+        self._last_manual_points: list[list[int]] = []  # 最近一次手动标注/修改的点（继承源头）
 
         # ── 布局 ──
         layout = QVBoxLayout(self)
@@ -987,6 +991,9 @@ class PointSelectionPanel(QWidget):
         self._images.clear()
         self._point_cache.clear()
         self._result_cache.clear()
+        self._disk_loaded.clear()
+        self._is_manual.clear()
+        self._last_manual_points = []
         self._current_idx = -1
         self._left_canvas.set_image(QPixmap())
         self._left_canvas.clear_points()
@@ -1013,17 +1020,19 @@ class PointSelectionPanel(QWidget):
         if idx < 0 or idx >= len(self._images):
             return
 
-        # 保存当前点集合到缓存 + 磁盘
+        # 保存当前点集合到缓存 + 磁盘（仅手动标注的图才持久化）
         if self._current_idx >= 0 and self._project:
-            pts = self._left_canvas.points()
-            if pts:
-                self._point_cache[self._current_idx] = pts
-                self._save_points_to_disk(self._current_idx)
-            else:
-                # 清空后也同步到磁盘
-                old = self._point_cache.pop(self._current_idx, None)
-                if old:
+            if self._is_manual.get(self._current_idx, False):
+                pts = self._left_canvas.points()
+                self._point_cache[self._current_idx] = [list(p) for p in pts]
+                if pts:
                     self._save_points_to_disk(self._current_idx)
+                    self._last_manual_points = [list(p) for p in pts]
+                else:
+                    # 手动清空 → 磁盘同步清空，清除继承源
+                    self._save_points_to_disk(self._current_idx)
+                    self._last_manual_points = []
+            # 自动（继承）的图未手动操作 → 不持久化，保持原状
 
         self._current_idx = idx
         self._page_spin.blockSignals(True)
@@ -1031,10 +1040,24 @@ class PointSelectionPanel(QWidget):
         self._page_spin.blockSignals(False)
         self._total_label.setText(f"/ {len(self._images)} 张")
 
-        # 先清除旧标点，等图片加载完成后再恢复（避免画在旧图上）
-        self._left_canvas.clear_points()
-        self._point_info_label.setText("左键正点 · 右键负点")
+        # 恢复标点：
+        #   1) 该图有缓存点（手动标注或之前继承的）→ 原样恢复
+        #   2) 没有 → 继承最近一次手动标注的点（自动点，标记非手动）
+        #   3) 无手动源 → 留空；磁盘兜底在图片加载完成后执行
         self._pending_points_idx = idx
+        cached = self._point_cache.get(idx)
+        if cached is not None:
+            self._left_canvas.set_points(cached)
+            self._update_points_info()
+        elif self._last_manual_points:
+            inherited = [list(p) for p in self._last_manual_points]
+            self._point_cache[idx] = inherited
+            self._is_manual[idx] = False
+            self._left_canvas.set_points(inherited)
+            self._update_points_info()
+        else:
+            self._left_canvas.clear_points()
+            self._point_info_label.setText("左键正点 · 右键负点")
 
         # 恢复右图结果
         if idx in self._result_cache:
@@ -1065,7 +1088,13 @@ class PointSelectionPanel(QWidget):
     # ------------------------------------------------------------------
 
     def _on_points_changed(self):
-        """画布上的点集合发生变化时更新信息。"""
+        """用户在某张图上手动点击添加点 → 标记为手动标注，更新继承源并持久化。"""
+        if self._current_idx >= 0:
+            pts = self._left_canvas.points()
+            self._point_cache[self._current_idx] = [list(p) for p in pts]
+            self._is_manual[self._current_idx] = True
+            self._last_manual_points = [list(p) for p in pts]
+            self._save_points_to_disk(self._current_idx)
         self._update_points_info()
 
     def _update_points_info(self):
@@ -1087,21 +1116,24 @@ class PointSelectionPanel(QWidget):
         self._update_batch_btn()
 
     def _update_batch_btn(self):
-        """根据缓存的标点数量更新批量分割按钮。"""
+        """根据缓存的标点数量更新批量分割按钮（仅统计手动标注的图）。"""
         if self._model_loaded:
-            count = sum(1 for pts in self._point_cache.values() if pts)
+            count = sum(1 for idx, pts in self._point_cache.items()
+                        if pts and self._is_manual.get(idx))
             self._batch_btn.setEnabled(count > 0)
         else:
             self._batch_btn.setEnabled(False)
 
     def _on_clear_points(self):
-        """清除所有点。"""
+        """清除所有点（手动清空 → 该图为手动且无点，不再继承也不被继承）。"""
         self._left_canvas.clear_points()
         self._point_info_label.setText("左键正点 · 右键负点")
         self._segment_btn.setEnabled(False)
         # 同步清除磁盘上的点数据
         if self._project and self._current_idx >= 0:
-            self._point_cache.pop(self._current_idx, None)
+            self._point_cache[self._current_idx] = []
+            self._is_manual[self._current_idx] = True
+            self._last_manual_points = []
             stem = Path(self._images[self._current_idx]).stem
             self._api.post(
                 f"/api/projects/{self._project}/sam/points/save",
@@ -1110,26 +1142,22 @@ class PointSelectionPanel(QWidget):
             )
 
     def _restore_points_after_image_load(self):
-        """图片加载完成后恢复标点（从缓存或磁盘）。"""
+        """图片加载完成后从磁盘加载该图保存的标点（若有则覆盖继承的默认点）。"""
         idx = self._pending_points_idx
         self._pending_points_idx = -1
-        if idx < 0 or idx >= len(self._images):
+        if idx < 0 or idx >= len(self._images) or not self._project:
             return
 
-        if idx in self._point_cache:
-            pts = self._point_cache[idx]
-            if pts:
-                self._left_canvas.set_points(pts)
-                self._update_points_info()
-                return
+        # 已从磁盘加载过 → 跳过
+        if idx in self._disk_loaded:
+            return
+        self._disk_loaded.add(idx)
 
-        # 缓存未命中，尝试从磁盘加载
-        if self._project:
-            stem = Path(self._images[idx]).stem
-            self._api.get(
-                f"/api/projects/{self._project}/sam/points/load/{stem}",
-                tag="point_load_points",
-            )
+        stem = Path(self._images[idx]).stem
+        self._api.get(
+            f"/api/projects/{self._project}/sam/points/load/{stem}",
+            tag="point_load_points",
+        )
 
     def _save_points_to_disk(self, idx: int):
         """将指定索引图片的点保存到后端磁盘。"""
@@ -1169,6 +1197,9 @@ class PointSelectionPanel(QWidget):
 
     def _on_segment(self):
         """按钮触发的分割 — 使用所有已选点。"""
+        if self._batch_mode:
+            self._log_msg("⚠ 批量分割进行中，请稍候")
+            return
         if not self._model_loaded:
             self._log_msg("⚠ 请先加载 SAM 模型")
             return
@@ -1187,24 +1218,27 @@ class PointSelectionPanel(QWidget):
             self._log_msg("⚠ 请先加载 SAM 模型")
             return
 
-        # 先保存当前图片的点到缓存
-        if self._current_idx >= 0:
+        # 先保存当前图片的点到缓存（仅手动标注的图）
+        if self._current_idx >= 0 and self._is_manual.get(self._current_idx, False):
             pts = self._left_canvas.points()
+            self._point_cache[self._current_idx] = [list(p) for p in pts]
             if pts:
-                self._point_cache[self._current_idx] = pts
                 self._save_points_to_disk(self._current_idx)
+                self._last_manual_points = [list(p) for p in pts]
 
-        # 收集所有有标点的图片索引
+        # 收集所有手动标注且带正点的图片索引（自动继承的图不参与，需用户手动确认）
         queue = sorted(idx for idx, pts in self._point_cache.items()
-                       if pts and any(l == 1 for _, _, l in pts))
+                       if pts and self._is_manual.get(idx)
+                       and any(l == 1 for _, _, l in pts))
         if not queue:
-            self._log_msg(f"⚠ 没有已标点的图片（当前缓存 {len(self._point_cache)} 个索引）")
+            self._log_msg(f"⚠ 没有手动标注的图片（自动继承的点需手动点击确认后才计入）")
             return
 
         self._batch_queue = queue
         self._batch_total = len(queue)
         self._batch_done = 0
         self._batch_mode = True
+        self._load_model_btn.setEnabled(False)
         self._segment_btn.setEnabled(False)
         self._batch_btn.setEnabled(False)
         self._batch_btn.setText("⏳ 批量中...")
@@ -1221,6 +1255,7 @@ class PointSelectionPanel(QWidget):
             self._batch_mode = False
             self._batch_btn.setText("📦 批量分割")
             self._update_batch_btn()
+            self._load_model_btn.setEnabled(True)
             self._segment_btn.setEnabled(self._model_loaded)
             self._page_spin.setEnabled(True)
             self._prev_btn.setEnabled(True)
@@ -1241,11 +1276,12 @@ class PointSelectionPanel(QWidget):
             self._process_next_batch()
             return
 
-        # 保存当前图片的点（如果有的话）
-        if self._current_idx >= 0:
+        # 保存当前图片的点（仅手动标注的图）
+        if self._current_idx >= 0 and self._is_manual.get(self._current_idx, False):
             cur_pts = self._left_canvas.points()
+            self._point_cache[self._current_idx] = [list(p) for p in cur_pts]
             if cur_pts:
-                self._point_cache[self._current_idx] = cur_pts
+                self._last_manual_points = [list(p) for p in cur_pts]
 
         # 直接切换（不走 _goto_image，避免延迟恢复标点）
         self._current_idx = idx
@@ -1330,6 +1366,9 @@ class PointSelectionPanel(QWidget):
             self._images = payload.get("images", [])
             self._point_cache.clear()
             self._result_cache.clear()
+            self._disk_loaded.clear()
+            self._is_manual.clear()
+            self._last_manual_points = []
             self._page_spin.setMaximum(max(1, len(self._images)))
             self._page_spin.setEnabled(len(self._images) > 0)
             self._log_msg(f"✓ 共 {len(self._images)} 张图片")
@@ -1343,14 +1382,30 @@ class PointSelectionPanel(QWidget):
         # ── 从磁盘加载标点 ──
         elif tag == "point_load_points":
             pts = payload.get("points", [])
-            if pts and self._current_idx >= 0:
-                self._point_cache[self._current_idx] = pts
-                # 如果当前正在显示这张图，刷新画布
-                stem = Path(self._images[self._current_idx]).stem
-                req_stem = Path(path).stem
-                if stem == req_stem:
-                    self._left_canvas.set_points(pts)
-                    self._update_points_info()
+            exists = payload.get("exists", False)
+            req_stem = Path(path).stem
+            if self._current_idx >= 0:
+                cur_stem = Path(self._images[self._current_idx]).stem
+                if cur_stem == req_stem:
+                    if exists and not self._is_manual.get(self._current_idx, False):
+                        # 磁盘有保存（含空 = 用户清空过）且本会话尚未手动修改 → 覆盖继承点，标记为手动源
+                        self._point_cache[self._current_idx] = [list(p) for p in pts]
+                        self._is_manual[self._current_idx] = True
+                        if pts:
+                            self._last_manual_points = [list(p) for p in pts]
+                        else:
+                            self._last_manual_points = []
+                        self._left_canvas.set_points(pts)
+                        self._update_points_info()
+                    # 已手动修改过（防磁盘响应覆盖刚点的点）或磁盘无保存 → 保留画布
+                else:
+                    # 当前已切换到其他图片，缓存到正确的索引（不更新手动源，避免覆盖更新的手动点）
+                    for i, fname in enumerate(self._images):
+                        if Path(fname).stem == req_stem:
+                            if exists:
+                                self._point_cache[i] = [list(p) for p in pts]
+                                self._is_manual[i] = True
+                            break
 
         # ── 左图 ──
         elif tag == "point_left_image":
@@ -1364,7 +1419,7 @@ class PointSelectionPanel(QWidget):
                 )
                 # 图片加载完成后恢复该图的标点（缓存或磁盘）
                 self._restore_points_after_image_load()
-                if self._model_loaded:
+                if self._model_loaded and not self._batch_mode:
                     self._segment_btn.setEnabled(True)
 
         # ── 模型加载 ──
@@ -1398,9 +1453,10 @@ class PointSelectionPanel(QWidget):
 
         # ── 分割结果 ──
         elif tag == "point_segment":
-            self._segment_btn.setEnabled(True)
-            self._segment_btn.setText("✂ 分割")
             is_batch = self._batch_mode
+            if not is_batch:
+                self._segment_btn.setEnabled(True)
+                self._segment_btn.setText("✂ 分割")
             if error:
                 self._log_msg(f"✗ 分割失败: {error}")
                 if not is_batch:
@@ -1420,12 +1476,16 @@ class PointSelectionPanel(QWidget):
                     self._status_label.setText(f"✓ 分割完成 (置信度: {score:.2f}, {len(points_used)}点)")
                 else:
                     self._status_label.setText(f"✓ 分割完成 ({len(points_used)}点)")
-                # 缓存当前点集合并保存到磁盘
+                # 缓存当前点集合并保存到磁盘（分割即确认 → 标记为手动）
                 if self._current_idx >= 0:
                     pts = self._left_canvas.points()
+                    self._point_cache[self._current_idx] = [list(p) for p in pts]
+                    self._is_manual[self._current_idx] = True
                     if pts:
-                        self._point_cache[self._current_idx] = pts
                         self._save_points_to_disk(self._current_idx)
+                        self._last_manual_points = [list(p) for p in pts]
+                    else:
+                        self._last_manual_points = []
                 # 加载结果图 — 优先轮廓图
                 if contour_path:
                     result_filename = Path(contour_path).name

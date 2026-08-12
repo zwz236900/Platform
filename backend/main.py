@@ -1040,12 +1040,15 @@ async def save_sam_points(project_name: str, stem: str = Form(...), points: str 
     """Persist point-click markers so they survive app restarts.
 
     points: JSON string like "[[800,600,1],[700,500,0]]"
+
+    Stores in SAM_output/point_marks/ (NOT point_results/) to avoid
+    permission conflicts with Docker-created output directories.
     """
     p = get_project(project_name)
     if p is None:
         raise HTTPException(404, "Project not found")
 
-    point_dir = DATA_DIR / project_name / "SAM_output" / "point_results"
+    point_dir = DATA_DIR / project_name / "SAM_output" / "point_marks"
     point_dir.mkdir(parents=True, exist_ok=True)
 
     safe_stem = os.path.basename(stem)
@@ -1074,16 +1077,16 @@ async def load_sam_points(project_name: str, stem: str):
     if safe_stem.startswith("..") or safe_stem.startswith("/"):
         raise HTTPException(400, "Invalid stem")
 
-    json_path = DATA_DIR / project_name / "SAM_output" / "point_results" / f"{safe_stem}_points.json"
+    json_path = DATA_DIR / project_name / "SAM_output" / "point_marks" / f"{safe_stem}_points.json"
     if not json_path.is_file():
-        return {"points": []}
+        return {"points": [], "exists": False}
 
     try:
         pts = json.loads(json_path.read_text(encoding="utf-8"))
     except Exception:
-        return {"points": []}
+        return {"points": [], "exists": True}
 
-    return {"points": pts}
+    return {"points": pts, "exists": True}
 
 
 @app.post("/api/projects/{project_name}/sam/run")
