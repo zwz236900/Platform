@@ -25,6 +25,7 @@ from modules.docker_runner import (
 from modules.image_preprocessor import strip_metadata, undistort_images
 from algorithm.pointcloud_filter import run as run_pointcloud_filter
 from algorithm.image_mask import run as run_image_mask
+from algorithm.mask_obj import run as run_mask_obj
 from modules.logger import get_logger, request_log
 from modules.models import (
     CameraModel,
@@ -44,6 +45,11 @@ from modules.mvs_runner import (
     remove_mvs_process,
     run_mvs_async,
 )
+from modules.mask_obj_runner import (
+    get_mask_obj_run_status,
+    is_mask_obj_running,
+    run_mask_obj_async,
+)
 from modules.gs_runner import (
     GS_COMMANDS,
     build_gs_command,
@@ -62,6 +68,7 @@ from modules.sam_runner import (
 )
 from modules.task_manager import (
     DATA_DIR,
+    _algorithm_output_dir,
     _input_image_dir,
     _mvs_output_dir,
     _sfm_output_dir,
@@ -320,14 +327,23 @@ async def upload_images(
     return {"success": True, "message": f"{num} images in project", "data": {"num_images": num}}
 
 
+def _undistorted_image_dir(project_name: str):
+    """去畸变图像目录（SfM 去畸变步骤产出，SAM/掩码均在此空间操作）。"""
+    return _sfm_output_dir(project_name) / "dense" / "images"
+
+
 @app.get("/api/projects/{project_name}/images/list")
 async def list_project_images(project_name: str):
-    """List all image filenames in a project."""
+    """List all undistorted image filenames in a project.
+
+    SAM 在去畸变图上分割（SFM_output/dense/images），这里列出同一份图。
+    未跑 SfM 去畸变时返回空列表。
+    """
     p = get_project(project_name)
     if p is None:
         raise HTTPException(404, "Project not found")
 
-    img_dir = _input_image_dir(project_name)
+    img_dir = _undistorted_image_dir(project_name)
     if not img_dir.is_dir():
         return {"project_name": project_name, "images": []}
 
@@ -341,7 +357,7 @@ async def list_project_images(project_name: str):
 
 @app.get("/api/projects/{project_name}/images/view/{filename:path}")
 async def view_project_image(project_name: str, filename: str):
-    """Serve an image file from the project's input_image directory."""
+    """Serve an undistorted image file (SFM_output/dense/images)."""
     p = get_project(project_name)
     if p is None:
         raise HTTPException(404, "Project not found")
@@ -350,7 +366,7 @@ async def view_project_image(project_name: str, filename: str):
     if safe.startswith("..") or safe.startswith("/"):
         raise HTTPException(400, "Invalid filename")
 
-    img_dir = _input_image_dir(project_name)
+    img_dir = _undistorted_image_dir(project_name)
     file_path = img_dir / safe
     if not file_path.is_file():
         raise HTTPException(404, f"Image not found: {filename}")
@@ -442,12 +458,15 @@ async def filter_project_pointcloud(
     project_name: str,
     threshold: float = Form(default=0.3),
     prompt_slug: str = Form(default="object"),
+    ply_path: str = Form(default=""),
 ):
     """Filter MVS dense point cloud using multi-view SAM mask consistency.
 
     Projects each 3D point into all camera views; keeps points that fall
     inside SAM mask regions in most views.
 
+    ply_path: 指定输入点云（COLMAP fused.ply / OpenMVS scene_dense.ply 等）。
+        留空 → 自动检测；相对路径 → 相对项目目录解析。
     Requires: MVS dense PLY + COLMAP sparse model + SAM masks.
     Output: algorithm_output/filtered_scene.ply
     """
@@ -458,10 +477,18 @@ async def filter_project_pointcloud(
     if threshold < 0.0 or threshold > 1.0:
         raise HTTPException(400, "threshold must be between 0.0 and 1.0")
 
-    logger.info("Project %r: starting pointcloud filter (threshold=%.2f, prompt=%s)",
-                project_name, threshold, prompt_slug)
+    # 解析输入点云：空 → 自动检测；相对路径 → 相对项目 DATA 目录
+    src = ply_path.strip()
+    if src and not os.path.isabs(src):
+        src = str(DATA_DIR / project_name / src)
+    src_or_none = src or None
+
+    logger.info("Project %r: starting pointcloud filter "
+                "(threshold=%.2f, prompt=%s, ply=%s)",
+                project_name, threshold, prompt_slug, src_or_none)
     result = await asyncio.to_thread(
         run_pointcloud_filter, project_name, threshold, prompt_slug,
+        ply_path=src_or_none,
     )
 
     if not result.get("success"):
@@ -472,6 +499,7 @@ async def filter_project_pointcloud(
         "message": f"Kept {result['num_points_after']:,} / {result['num_points_before']:,} points",
         "data": {
             "output_path": result["output_path"],
+            "input_path": result.get("input_path", src_or_none or ""),
             "num_points_before": result["num_points_before"],
             "num_points_after": result["num_points_after"],
         },
@@ -911,12 +939,14 @@ async def sam_box_segment(
     if safe.startswith("..") or safe.startswith("/"):
         raise HTTPException(400, "Invalid filename")
 
-    img_dir = _input_image_dir(project_name)
+    img_dir = _undistorted_image_dir(project_name)
+    if not img_dir.is_dir():
+        raise HTTPException(400, "未找到去畸变图像（SFM_output/dense/images），请先完成 SfM 去畸变步骤")
     image_path = img_dir / safe
     if not image_path.is_file():
         raise HTTPException(404, f"Image not found: {filename}")
 
-    container_image = f"/data/{project_name}/Input/input_image/{safe}"
+    container_image = f"/data/{project_name}/SFM_output/dense/images/{safe}"
     container_output = f"/data/{project_name}/SAM_output/box_results"
     stem = Path(safe).stem
 
@@ -960,6 +990,7 @@ async def sam_point_segment(
     points: str = Form(default=""),
     x: int = Form(default=0),   # deprecated, kept for backward compatibility
     y: int = Form(default=0),   # deprecated, kept for backward compatibility
+    req_id: str = Form(default=""),  # 批量分割请求标识，原样回传供前端校验响应是否过期
 ):
     """Run SAM inference on a single image with point prompt(s) (persistent GPU worker).
 
@@ -974,7 +1005,9 @@ async def sam_point_segment(
     if safe.startswith("..") or safe.startswith("/"):
         raise HTTPException(400, "Invalid filename")
 
-    img_dir = _input_image_dir(project_name)
+    img_dir = _undistorted_image_dir(project_name)
+    if not img_dir.is_dir():
+        raise HTTPException(400, "未找到去畸变图像（SFM_output/dense/images），请先完成 SfM 去畸变步骤")
     image_path = img_dir / safe
     if not image_path.is_file():
         raise HTTPException(404, f"Image not found: {filename}")
@@ -988,7 +1021,7 @@ async def sam_point_segment(
     if not point_list:
         raise HTTPException(400, "At least one point is required")
 
-    container_image = f"/data/{project_name}/Input/input_image/{safe}"
+    container_image = f"/data/{project_name}/SFM_output/dense/images/{safe}"
     container_output = f"/data/{project_name}/SAM_output/point_results"
     stem = Path(safe).stem
 
@@ -1017,6 +1050,7 @@ async def sam_point_segment(
     return {
         "success": True,
         "message": "Point segmentation completed",
+        "req_id": req_id,
         "data": {
             "mask_path": result.get("mask_path"),
             "overlay_path": result.get("overlay_path"),
@@ -1613,6 +1647,177 @@ async def download_mvs_file(project_name: str, filename: str,
 
 
 # ---------------------------------------------------------------------------
+# API Routes — 掩码目标重建（mask_obj）
+# ---------------------------------------------------------------------------
+
+
+def _mask_obj_dir(project_name: str) -> Path:
+    return _algorithm_output_dir(project_name) / "mask_obj"
+
+
+@app.post("/api/projects/{project_name}/mask-obj/run")
+async def run_mask_obj_pipeline(
+    project_name: str,
+    mask_source: str = Form(default="point"),
+    padding: int = Form(default=5),
+):
+    """按 SAM 掩码裁剪去畸变图 → 调整稀疏模型 → 启动 MVS 稠密重建。
+
+    裁剪 + 建模同步执行（纯 Python，快）；成功后才启动 sfm_cli.py --steps mvs
+    的 docker 任务。mask_source 选 SAM 掩码来源（point=point_results，box=box_results）。
+    """
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+    if is_mask_obj_running(project_name):
+        raise HTTPException(400, "掩码目标重建任务已在运行")
+
+    if mask_source not in ("point", "box"):
+        raise HTTPException(400, f"Invalid mask_source: {mask_source}. Choices: point, box")
+
+    result = await asyncio.to_thread(
+        run_mask_obj, project_name, mask_source=mask_source, padding=padding)
+    if not result.get("success"):
+        raise HTTPException(500, result.get("error", "mask_obj 裁剪建模失败"))
+
+    cmd = result["command"]
+    logger.info("Project %r: starting mask_obj MVS, %d image(s) cropped",
+                project_name, result.get("images_cropped", 0))
+
+    # 裁剪摘要先写进日志，前端轮询立刻能看到
+    log_path = _mask_obj_dir(project_name) / "mask_obj.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write("\n" + "=" * 60 + "\n")
+        f.write(f"=== MASK_OBJ CROP {project_name} ===\n")
+        f.write(f"  裁剪图像: {result['images_cropped']}  "
+                f"跳过(无掩码): {result['images_skipped_no_mask']}  "
+                f"跳过(无文件): {result['images_skipped_no_file']}\n")
+        f.write(f"  相机: {result['num_cameras']}  3D 点: {result['num_points3D']}\n")
+        f.write(f"  输出: {result['output_dir']}\n")
+        f.write(f"  命令: {' '.join(cmd)}\n")
+
+    await asyncio.to_thread(run_mask_obj_async, project_name, cmd)
+    return {
+        "success": True,
+        "message": "掩码目标重建已启动（裁剪完成，MVS 运行中）",
+        "data": {
+            "images_cropped": result["images_cropped"],
+            "images_skipped": result["images_skipped_no_mask"],
+        },
+    }
+
+
+@app.get("/api/projects/{project_name}/mask-obj/log")
+async def get_mask_obj_log(project_name: str, lines: int = 100):
+    """Get mask_obj pipeline log (algorithm_output/mask_obj/mask_obj.log)."""
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    log_path = _mask_obj_dir(project_name) / "mask_obj.log"
+    if not log_path.exists():
+        return {"project_name": project_name, "log": "(no log yet)"}
+
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+        return {"project_name": project_name, "log": "".join(all_lines[-lines:])}
+    except OSError:
+        return {"project_name": project_name, "log": "(error reading log)"}
+
+
+@app.get("/api/projects/{project_name}/mask-obj/result")
+async def get_mask_obj_result(project_name: str):
+    """返回掩码目标重建状态 + 裁剪统计 + fused.ply 信息。"""
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    st = get_mask_obj_run_status(project_name)
+    run_status = st.get("status", "idle") if st else "idle"
+    exit_code = (st or {}).get("exit_code")
+
+    out = _mask_obj_dir(project_name)
+    crop: dict = {}
+    crop_json = out / "crop_result.json"
+    if crop_json.is_file():
+        try:
+            with open(crop_json, encoding="utf-8") as f:
+                crop = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            crop = {}
+
+    fused = out / "fused.ply"
+    fused_mb = round(fused.stat().st_size / (1024 * 1024), 2) if fused.is_file() else None
+    # 只要 fused.ply 在且当前不在运行/失败，就视为完成。
+    # （后端重启后 run_status 会丢失成 idle，但仍应显示既有结果。）
+    ready = fused.is_file() and run_status not in ("running", "failed")
+
+    if run_status == "failed":
+        status, message = "failed", "掩码目标重建失败（MVS 进程异常退出）"
+    elif run_status == "running":
+        status, message = "running", "掩码目标重建运行中..."
+    elif ready:
+        status, message = "ok", "掩码目标重建成功"
+    else:
+        status, message = "pending", "暂无结果：尚未运行，或 MVS 未产出 fused.ply"
+
+    return {
+        "project_name": project_name,
+        "run_status": run_status,
+        "exit_code": exit_code,
+        "ready": ready,
+        "status": status,
+        "images_cropped": crop.get("images_cropped"),
+        "images_skipped_no_mask": crop.get("images_skipped_no_mask"),
+        "num_cameras": crop.get("num_cameras"),
+        "num_points3D": crop.get("num_points3D"),
+        "fused_size_mb": fused_mb,
+        "message": message,
+    }
+
+
+@app.get("/api/projects/{project_name}/mask-obj/files")
+async def list_mask_obj_files(project_name: str):
+    """List 可下载产物（fused.ply / cropped_images.zip / pipeline.log）。"""
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    out = _mask_obj_dir(project_name)
+    products: list[dict] = []
+    if out.is_dir():
+        for name, step, label in (
+            ("fused.ply", "稠密重建", "fused.ply"),
+            ("cropped_images.zip", "裁剪图", "cropped_images.zip"),
+            ("pipeline.log", "日志", "pipeline.log"),
+        ):
+            if (out / name).is_file():
+                products.append({"step": step, "label": label, "path": name})
+    return {"project_name": project_name, "products": products}
+
+
+@app.get("/api/projects/{project_name}/mask-obj/download/{filename:path}")
+async def download_mask_obj_file(project_name: str, filename: str):
+    """Download a result file from algorithm_output/mask_obj directory."""
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    safe_path = os.path.normpath(filename)
+    if safe_path.startswith("..") or safe_path.startswith("/"):
+        raise HTTPException(400, "Invalid filename")
+
+    file_path = _mask_obj_dir(project_name) / safe_path
+    if not file_path.exists():
+        raise HTTPException(404, f"File not found: {filename}")
+
+    return FileResponse(file_path, filename=Path(filename).name,
+                        media_type="application/octet-stream")
+
+
+# ---------------------------------------------------------------------------
 # Helpers — 3DGS
 # ---------------------------------------------------------------------------
 
@@ -1802,11 +2007,10 @@ async def get_gs_result(project_name: str):
 
 @app.get("/api/projects/{project_name}/3dgs/files")
 async def list_gs_files(project_name: str):
-    """列出 3DGS 产物，按步骤标注，只含真正可下载的产物。
+    """列出 3DGS 产物：只有高斯点云。
 
-    训练 → 点云（各迭代）+ 检查点；渲染 → 渲染图（最新迭代，训练/测试集）。
-    排除 gt 原图、日志、输入与中间配置（cameras.json / cfg_args / input.ply 等），
-    不把整个 3DGS_output 目录倾倒给前端。
+    3DGS 运行对用户有意义的最终产物就是高斯点云（point_cloud.ply）。
+    检查点、渲染图、日志、中间配置等都不放进下载框，避免干扰。
     """
     p = get_project(project_name)
     if p is None:
@@ -1814,53 +2018,22 @@ async def list_gs_files(project_name: str):
 
     gs_dir = _gs_output_dir(project_name)
     products: list[dict] = []
-    if not gs_dir.is_dir():
-        return {"project_name": project_name, "products": products}
-
-    # ── 训练：点云（各迭代，最新在前）──
-    pc_root = gs_dir / "point_cloud"
-    if pc_root.is_dir():
-        pc_dirs = [d for d in pc_root.iterdir()
-                   if d.is_dir() and d.name.startswith("iteration_")]
-        pc_dirs.sort(
-            key=lambda d: int(d.name.split("_")[1]), reverse=True)
-        for d in pc_dirs:
-            ply = d / "point_cloud.ply"
-            if ply.is_file():
-                products.append({
-                    "step": "训练",
-                    "label": f"点云（{d.name}）",
-                    "path": str(ply.relative_to(gs_dir)).replace(os.sep, "/"),
-                })
-
-    # ── 训练：检查点（最新在前）──
-    ckpts = sorted(
-        gs_dir.glob("chkpnt*.pth"),
-        key=lambda p: int(p.stem.replace("chkpnt", "")), reverse=True)
-    for ckpt in ckpts:
-        products.append({
-            "step": "训练",
-            "label": f"检查点（{ckpt.name}）",
-            "path": ckpt.name,
-        })
-
-    # ── 渲染：最新迭代的训练/测试集渲染图（排除 gt）──
-    for split, split_label in (("train", "训练集"), ("test", "测试集")):
-        split_root = gs_dir / split
-        if not split_root.is_dir():
-            continue
-        for ours in sorted(split_root.iterdir(), reverse=True):
-            if ours.is_dir() and ours.name.startswith("ours_"):
-                rdir = ours / "renders"
-                if rdir.is_dir():
-                    for png in sorted(rdir.iterdir()):
-                        if png.suffix.lower() == ".png":
-                            products.append({
-                                "step": "渲染",
-                                "label": f"{png.stem}（{split_label}）",
-                                "path": str(png.relative_to(gs_dir)).replace(os.sep, "/"),
-                            })
-                break  # 只取最新迭代
+    if gs_dir.is_dir():
+        # 点云（各迭代，最新在前）
+        pc_root = gs_dir / "point_cloud"
+        if pc_root.is_dir():
+            pc_dirs = [d for d in pc_root.iterdir()
+                       if d.is_dir() and d.name.startswith("iteration_")]
+            pc_dirs.sort(
+                key=lambda d: int(d.name.split("_")[1]), reverse=True)
+            for d in pc_dirs:
+                ply = d / "point_cloud.ply"
+                if ply.is_file():
+                    products.append({
+                        "step": "训练",
+                        "label": f"点云（{d.name}）",
+                        "path": str(ply.relative_to(gs_dir)).replace(os.sep, "/"),
+                    })
 
     return {"project_name": project_name, "products": products}
 

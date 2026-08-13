@@ -48,6 +48,10 @@ def _sfm_output_dir(project_name: str) -> Path:
     return _project_dir(project_name) / "SFM_output"
 
 
+def _algorithm_output_dir(project_name: str) -> Path:
+    return _project_dir(project_name) / "algorithm_output"
+
+
 def _result_json(project_name: str) -> Path:
     """Path to pipeline_result.json (inside SFM_output)."""
     return _sfm_output_dir(project_name) / "pipeline_result.json"

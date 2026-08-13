@@ -12,7 +12,7 @@ from pages.sfm import SfMPage
 from pages.mvs import MvsPage
 from pages.sam import SAMPage
 from pages.filter_page import FilterPage
-from pages.mask import MaskPage
+from pages.mask import MaskObjPage
 from pages.gs import GsPage
 
 PAGES = [
@@ -23,7 +23,7 @@ PAGES = [
     ("gs",           "3DGS 重建",    GsPage),
     ("sam",          "SAM 分割",     SAMPage),
     ("filter",       "点云过滤",     FilterPage),
-    ("mask",         "图像掩码",     MaskPage),
+    ("mask_obj",     "掩码目标重建", MaskObjPage),
 ]
 
 

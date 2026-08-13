@@ -41,10 +41,10 @@ def build_sam_command(
     """Build the docker exec command to run SAM_CLI.py inside the sam3 container.
 
     Project layout inside container:
-        /data/<project>/Input/input_image/   →  --input-dir
-        /data/<project>/SAM_output/          →  -o
+        /data/<project>/SFM_output/dense/images/   →  --input-dir（去畸变图，SAM 在其上分割）
+        /data/<project>/SAM_output/                →  -o
     """
-    image_dir = DATA_DIR_CONTAINER / project_name / "Input" / "input_image"
+    image_dir = DATA_DIR_CONTAINER / project_name / "SFM_output" / "dense" / "images"
     output_dir = DATA_DIR_CONTAINER / project_name / "SAM_output"
 
     cmd = [

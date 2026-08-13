@@ -34,7 +34,7 @@ class Sidebar(QWidget):
         "gs":          "✨",
         "sam":         "✂",
         "filter":      "🧹",
-        "mask":        "🖌",
+        "mask_obj":    "🖌",
     }
 
     def __init__(self, items: list[tuple[str, str]], parent=None):

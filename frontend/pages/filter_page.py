@@ -35,6 +35,20 @@ API_BASE = "http://localhost:8000"
 
 FILTERED_FILENAME = "filtered_scene.ply"
 
+# 输入点云来源选项（value → 相对项目目录的路径；auto/custom 走特判）
+SOURCE_OPTIONS = [
+    ("auto",        "自动检测（按顺序找可用点云）"),
+    ("colmap",      "COLMAP 稠密点云（fused.ply）"),
+    ("openmvs",     "OpenMVS 稠密点云（scene_dense.ply）"),
+    ("openmvs_mesh","OpenMVS 网格点云（scene_dense_mesh.ply）"),
+    ("custom",      "自定义路径…"),
+]
+SOURCE_PATHS = {
+    "colmap":       "MVS_output/colmap/fused.ply",
+    "openmvs":      "MVS_output/openmvs/scene_dense.ply",
+    "openmvs_mesh": "MVS_output/openmvs/scene_dense_mesh.ply",
+}
+
 
 def _format_size(n: int) -> str:
     """人类可读的文件大小。"""
@@ -96,13 +110,27 @@ class FilterPage(BasePage):
         self.prompt_edit.setText("center_object")
         form.addRow("Prompt Slug:", self.prompt_edit)
 
+        # 输入点云来源：选择过滤哪一份 MVS 点云（COLMAP / OpenMVS / 自定义）
+        self.source_combo = QComboBox()
+        for value, label in SOURCE_OPTIONS:
+            self.source_combo.addItem(label, value)
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+        form.addRow("输入点云:", self.source_combo)
+
+        self.ply_path_edit = QLineEdit()
+        self.ply_path_edit.setPlaceholderText(
+            "服务器上的点云路径（绝对路径，或相对项目目录，如 MVS_output/xxx.ply）")
+        self.ply_path_edit.setVisible(False)
+        form.addRow("自定义路径:", self.ply_path_edit)
+
         self.content_layout.addWidget(group)
 
         # ── 说明 ──
         hint = QLabel(
             "将每个三维点投影到所有相机视图，统计其落入 SAM 掩码内的比例，"
             "比例 ≥ 阈值的点被保留。\n"
-            "需要：MVS 稠密点云 + COLMAP 稀疏模型 + SAM 掩码（algorithm_output/filtered_scene.ply）。"
+            "输入点云可选 COLMAP 或 OpenMVS 的稠密点云（默认自动检测）。\n"
+            "需要：MVS 点云 + COLMAP 稀疏模型 + SAM 掩码（输出 algorithm_output/filtered_scene.ply）。"
         )
         hint.setStyleSheet("color:#8b949e; font-size:12px;")
         hint.setWordWrap(True)
@@ -206,6 +234,18 @@ class FilterPage(BasePage):
     # 运行过滤
     # ------------------------------------------------------------------
 
+    def _on_source_changed(self):
+        """选中「自定义路径」时显示路径输入框，其余隐藏。"""
+        custom = self.source_combo.currentData() == "custom"
+        self.ply_path_edit.setVisible(custom)
+
+    def _resolve_ply_path(self) -> str:
+        """根据输入点云来源返回 ply_path（空串 = 让后端自动检测）。"""
+        source = self.source_combo.currentData() or "auto"
+        if source == "custom":
+            return self.ply_path_edit.text().strip()
+        return SOURCE_PATHS.get(source, "")
+
     def _on_run(self):
         project = self.project_combo.currentText().strip()
         if not project:
@@ -217,18 +257,26 @@ class FilterPage(BasePage):
             QMessageBox.warning(self, "提示", "请填写 Prompt Slug。")
             return
 
+        ply_path = self._resolve_ply_path()
+        if self.source_combo.currentData() == "custom" and not ply_path:
+            QMessageBox.warning(self, "提示", "请填写自定义点云路径。")
+            return
+
         self._current_project = project
         self._set_running(True)
         self._status_label.setText("过滤运行中...")
         self.result_label.setText("⏳ 正在过滤，请稍候（密集点云可能需要几分钟）...")
         self._log_msg(f"▶ 开始点云过滤 — 项目: {project}")
         self._log_msg(f"  阈值: {self.threshold_spin.value():.2f}, prompt: {prompt}")
+        self._log_msg(f"  输入点云: {self.source_combo.currentText()}"
+                      + (f" → {ply_path}" if ply_path else ""))
 
         self._api.post(
             f"/api/projects/{project}/preprocess/filter-pointcloud",
             {
                 "threshold": str(self.threshold_spin.value()),
                 "prompt_slug": prompt,
+                "ply_path": ply_path,
             },
             tag="filter_run",
         )
@@ -317,11 +365,13 @@ class FilterPage(BasePage):
                 before = data.get("num_points_before", 0)
                 after = data.get("num_points_after", 0)
                 output_path = data.get("output_path", "")
+                input_path = data.get("input_path", "")
                 self._log_msg(
                     f"✓ 过滤完成: {after:,} / {before:,} 点 → {output_path}"
                 )
                 self.result_label.setText(
                     f"✅ 过滤完成\n"
+                    f"  输入: {input_path or '（自动检测）'}\n"
                     f"  过滤前: {before:,} 点\n"
                     f"  过滤后: {after:,} 点\n"
                     f"  保留率: {100 * after / before:.1f}%\n"

@@ -111,6 +111,109 @@ def read_images_bin(path: Path) -> dict[int, dict[str, Any]]:
     return images
 
 
+def read_cameras_text(path: Path) -> dict[int, dict[str, Any]]:
+    """Read cameras.txt → dict[cam_id, {model_id, width, height, params, K}].
+
+    每行: CAMERA_ID MODEL WIDTH HEIGHT PARAMS…（空格分隔，与 BIN 版本返回同构）。
+    """
+    model_ids = {
+        "SIMPLE_PINHOLE": 0, "PINHOLE": 1, "SIMPLE_RADIAL": 2, "RADIAL": 3,
+        "OPENCV": 4, "OPENCV_FISHEYE": 5, "FULL_OPENCV": 6,
+    }
+    cameras = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            cam_id = int(parts[0])
+            model_name = parts[1]
+            w, h = int(parts[2]), int(parts[3])
+            params = np.array([float(x) for x in parts[4:]], dtype=np.float64)
+
+            # 与 BIN 版本一致：SIMPLE_* 只有单个焦距 f
+            if model_name in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL"):
+                fx, fy, cx, cy = params[0], params[0], params[1], params[2]
+            else:
+                fx, fy, cx, cy = params[0], params[1], params[2], params[3]
+
+            K = np.array([[fx, 0, cx],
+                          [0, fy, cy],
+                          [0, 0,  1]], dtype=np.float64)
+
+            cameras[cam_id] = {
+                "model_id": model_ids.get(model_name, 1),
+                "width": int(w),
+                "height": int(h),
+                "params": params,
+                "K": K,
+            }
+    return cameras
+
+
+def read_images_text(path: Path) -> dict[int, dict[str, Any]]:
+    """Read images.txt → dict[img_id, {qvec, tvec, cam_id, name, R, t}].
+
+    每张图两行：首行 IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME，
+    次行为 2D 观测（过滤算法不关心，跳过）。
+    """
+    images = {}
+    with open(path, "r", encoding="utf-8") as f:
+        raw = f.readlines()
+    i = 0
+    while i < len(raw):
+        line = raw[i].strip()
+        if not line or line.startswith("#"):
+            i += 1
+            continue
+        parts = line.split()
+        if len(parts) < 9:
+            i += 1
+            continue
+        img_id = int(parts[0])
+        qvec = np.array([float(x) for x in parts[1:5]], dtype=np.float64)
+        tvec = np.array([float(x) for x in parts[5:8]], dtype=np.float64)
+        cam_id = int(parts[8])
+        name = parts[9] if len(parts) > 9 else ""
+        R = qvec2rotmat(qvec)
+
+        images[img_id] = {
+            "qvec": qvec,
+            "tvec": tvec,
+            "cam_id": cam_id,
+            "name": name,
+            "R": R,
+            "t": tvec,
+        }
+        i += 2  # 跳过紧随其后的 2D 观测行
+    return images
+
+
+def load_sparse_model(sparse_dir: Path):
+    """按需读取 COLMAP 稀疏模型（bin 或 txt 自动识别）。
+
+    Returns:
+        (cameras, images) dict；目录里两者都缺时返回 (None, None)。
+    """
+    cameras = images = None
+    for name in ("cameras.bin", "cameras.txt"):
+        if (sparse_dir / name).exists():
+            cameras = (read_cameras_bin if name.endswith(".bin")
+                       else read_cameras_text)(sparse_dir / name)
+            break
+    for name in ("images.bin", "images.txt"):
+        if (sparse_dir / name).exists():
+            images = (read_images_bin if name.endswith(".bin")
+                      else read_images_text)(sparse_dir / name)
+            break
+    if cameras is None or images is None:
+        return None, None
+    return cameras, images
+
+
 # ---------------------------------------------------------------------------
 # Quaternion / rotation
 # ---------------------------------------------------------------------------

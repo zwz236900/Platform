@@ -19,8 +19,7 @@ import numpy as np
 from PIL import Image
 
 from .common import (
-    read_cameras_bin,
-    read_images_bin,
+    load_sparse_model,
     read_ply,
     write_ply,
     project_points,
@@ -63,7 +62,9 @@ def run(
         _default_ply = project / "MVS_output" / "scene_dense.ply"  # legacy
 
     ply_file = Path(ply_path or _default_ply)
-    sparse = Path(sparse_dir or (project / "SFM_output" / "undistorted" / "sparse"))
+    # 去畸变模型现在在 SFM_output/dense/ 下（dense/sparse + dense/images），
+    # 而非旧路径 SFM_output/undistorted/。
+    sparse = Path(sparse_dir or (project / "SFM_output" / "dense" / "sparse"))
     sam = Path(sam_dir or (project / "SAM_output"))
     out = Path(output_path or (project / "algorithm_output" / "filtered_scene.ply"))
 
@@ -72,14 +73,11 @@ def run(
         return {"success": False, "output_path": str(out),
                 "num_points_before": 0, "num_points_after": 0,
                 "error": f"Point cloud not found: {ply_file}"}
-    if not (sparse / "cameras.bin").exists():
+    cameras, images = load_sparse_model(sparse)
+    if cameras is None:
         return {"success": False, "output_path": str(out),
                 "num_points_before": 0, "num_points_after": 0,
-                "error": f"cameras.bin not found in {sparse}"}
-    if not (sparse / "images.bin").exists():
-        return {"success": False, "output_path": str(out),
-                "num_points_before": 0, "num_points_after": 0,
-                "error": f"images.bin not found in {sparse}"}
+                "error": f"COLMAP 稀疏模型缺失（cameras/images 的 bin 或 txt）: {sparse}"}
     if not sam.is_dir():
         return {"success": False, "output_path": str(out),
                 "num_points_before": 0, "num_points_after": 0,
@@ -91,13 +89,12 @@ def run(
     n_before = xyz.shape[0]
     print(f"  → {n_before:,} points")
 
-    print(f"Loading cameras from: {sparse}")
-    cameras = read_cameras_bin(sparse / "cameras.bin")
-    images = read_images_bin(sparse / "images.bin")
+    print(f"Loading sparse model from: {sparse}")
     print(f"  → {len(cameras)} camera(s), {len(images)} image(s)")
 
     # --- Build per-view data ---
     views: list[dict] = []  # each: {K, R, t, w, h, mask, name}
+    n_masks = 0
     for img_id, img in images.items():
         cam = cameras.get(img["cam_id"])
         if cam is None:
@@ -109,6 +106,7 @@ def run(
         if mask is None:
             print(f"  SKIP {img['name']} — no mask found")
             continue
+        n_masks += 1
 
         views.append({
             "K": cam["K"],
@@ -123,8 +121,11 @@ def run(
     if not views:
         return {"success": False, "output_path": str(out),
                 "num_points_before": n_before, "num_points_after": 0,
-                "error": "No views with valid masks found"}
-    print(f"  → {len(views)} views with masks")
+                "error": (f"No views with valid masks found "
+                          f"(searched {sam / 'point_results'}/ and {sam}/ "
+                          f"for {Path(next(iter(images.values()))['name']).stem}_mask*.png "
+                          f"& _{prompt_slug}_mask*.png)")}
+    print(f"  → {len(views)} views with masks ({n_masks} mask file(s))")
 
     # --- Batch score ---
     n = n_before
@@ -178,6 +179,7 @@ def run(
 
     return {
         "success": True,
+        "input_path": str(ply_file),
         "output_path": str(out),
         "num_points_before": n_before,
         "num_points_after": int(n_after),
@@ -190,17 +192,35 @@ def run(
 # ---------------------------------------------------------------------------
 
 def _load_mask(sam_dir: Path, image_name: str, prompt_slug: str,
-               target_w: int | None = None, target_h: int | None = None) -> np.ndarray | None:
+               target_w: int | None = None, target_h: int | None = None,
+               results_subdir: str = "point_results") -> np.ndarray | None:
     """Load and merge all SAM masks for one image (logical OR).
+
+    支持两套 SAM_output 布局（都搜，按需并入）：
+      - 新版：``SAM_output/{results_subdir}/{stem}_mask.png``（worker 每次分割覆盖写入，
+        无 prompt 后缀；box 分割在 box_results/，用 results_subdir 选）。
+      - 旧版：``SAM_output/{stem}_{prompt_slug}_mask*.png``（带 prompt 后缀 + 序号）。
 
     Optionally resizes to (target_h, target_w) to match camera dimensions.
     """
     base = Path(image_name).stem
+    found: list[Path] = []
+    for d in (sam_dir / results_subdir, sam_dir):
+        if not d.is_dir():
+            continue
+        found += sorted(d.glob(f"{base}_mask*.png"))
+        found += sorted(d.glob(f"{base}_{prompt_slug}_mask*.png"))
+
     merged = None
-    for mp in sorted(sam_dir.glob(f"{base}_{prompt_slug}_mask*.png")):
+    for mp in found:
         m = np.array(Image.open(mp)) >= 128
         if merged is None:
             merged = m
+        elif m.shape != merged.shape:
+            # 异常保护：尺寸不一致时以第一张为准对齐
+            m_img = Image.fromarray(m.astype(np.uint8) * 255)
+            m_img = m_img.resize((merged.shape[1], merged.shape[0]), Image.NEAREST)
+            merged |= np.array(m_img) >= 128
         else:
             merged |= m
     if merged is not None and target_w is not None and target_h is not None:

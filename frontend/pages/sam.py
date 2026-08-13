@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, parse_qs, urlparse
 
 from PySide6.QtWidgets import (
     QLabel,
@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QButtonGroup,
 )
-from PySide6.QtCore import Qt, Signal, QUrl, QRect, QPoint, QEvent
+from PySide6.QtCore import Qt, Signal, QUrl, QRect, QPoint, QEvent, QTimer
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 from PySide6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QMouseEvent, QPaintEvent
 
@@ -63,7 +63,8 @@ class SamApiClient(QWidget):
         reply = self._mgr.get(req)
         self._tag(reply, "GET", path, tag)
 
-    def post(self, path: str, form_data: dict | None = None, tag: str = ""):
+    def post(self, path: str, form_data: dict | None = None, tag: str = "",
+             meta: dict | None = None):
         url = QUrl(API_BASE + path)
         req = QNetworkRequest(url)
         if form_data:
@@ -72,7 +73,7 @@ class SamApiClient(QWidget):
             reply = self._mgr.post(req, body)
         else:
             reply = self._mgr.post(req, b"")
-        self._tag(reply, "POST", path, tag)
+        self._tag(reply, "POST", path, tag, meta=meta)
 
     def fetch_image(self, path: str, tag: str = ""):
         url = QUrl(API_BASE + path)
@@ -84,16 +85,20 @@ class SamApiClient(QWidget):
     # 内部
     # ------------------------------------------------------------------
 
-    def _tag(self, reply: QNetworkReply, method: str, path: str, tag: str):
+    def _tag(self, reply: QNetworkReply, method: str, path: str, tag: str,
+             meta: dict | None = None):
         reply.setProperty("_tag", tag)
         reply.setProperty("_method", method)
         reply.setProperty("_path", path)
+        if meta:
+            reply.setProperty("_meta", meta)
         reply.finished.connect(lambda r=reply, s=self: s._on_finished(r))
 
     def _on_finished(self, reply: QNetworkReply):
         method = reply.property("_method")
         path = reply.property("_path")
         tag = reply.property("_tag")
+        meta = reply.property("_meta") or {}
         try:
             if reply.error() != QNetworkReply.NoError:
                 err_text = bytes(reply.readAll()).decode("utf-8", errors="replace")
@@ -102,7 +107,9 @@ class SamApiClient(QWidget):
                     err_msg = err_obj.get("detail", err_text)
                 except Exception:
                     err_msg = err_text or reply.errorString()
-                self.finished.emit(method, path, {"_error": err_msg, "_tag": tag})
+                payload = dict(meta)
+                payload.update({"_error": err_msg, "_tag": tag})
+                self.finished.emit(method, path, payload)
             elif method == "GET_IMAGE":
                 data = bytes(reply.readAll())
                 self.finished.emit(method, path, {"_image_data": data, "_tag": tag})
@@ -110,10 +117,13 @@ class SamApiClient(QWidget):
                 data = bytes(reply.readAll()).decode("utf-8", errors="replace")
                 try:
                     obj = json.loads(data)
+                    obj.update(meta)
                     obj["_tag"] = tag
                     self.finished.emit(method, path, obj)
                 except Exception:
-                    self.finished.emit(method, path, {"_raw": data, "_tag": tag})
+                    payload = dict(meta)
+                    payload.update({"_raw": data, "_tag": tag})
+                    self.finished.emit(method, path, payload)
         finally:
             reply.deleteLater()
 
@@ -849,6 +859,12 @@ class PointSelectionPanel(QWidget):
         self._batch_total: int = 0
         self._batch_done: int = 0
         self._batch_mode: bool = False
+        self._batch_seq: int = 0           # 批量请求递增序号（生成 req_id）
+        self._batch_pending_id: str = ""   # 当前在途批量请求的 req_id（用于识别过期响应）
+        self._batch_timer = QTimer(self)
+        self._batch_timer.setSingleShot(True)
+        self._batch_timer.setInterval(120_000)  # 看门狗：120s 无响应则跳过，防止批量卡死
+        self._batch_timer.timeout.connect(self._on_batch_timeout)
         self._pending_points_idx: int = -1  # 等待图片加载完成后恢复标点的索引
         self._disk_loaded: set[int] = set()  # 已从磁盘加载过标点的索引
         # 区分手动/自动（继承）标注
@@ -1011,6 +1027,10 @@ class PointSelectionPanel(QWidget):
         self._disk_loaded.clear()
         self._is_manual.clear()
         self._last_manual_points = []
+        # 切换项目时中止任何进行中的批量分割
+        self._batch_mode = False
+        self._batch_timer.stop()
+        self._batch_queue = []
         self._current_idx = -1
         self._left_canvas.set_image(QPixmap())
         self._left_canvas.clear_points()
@@ -1054,6 +1074,8 @@ class PointSelectionPanel(QWidget):
         self._goto_image(self._current_idx + 1)
 
     def _goto_image(self, idx: int):
+        if self._batch_mode:
+            return  # 批量分割进行中不允许切换图片（键盘方向键也会走到这里）
         if idx < 0 or idx >= len(self._images):
             return
 
@@ -1147,16 +1169,20 @@ class PointSelectionPanel(QWidget):
         if neg_count:
             parts.append(f"−{neg_count}")
         self._point_info_label.setText("正点: " + ", ".join(parts) if parts else "左键正点 · 右键负点")
-        # 模型已加载且有正点时，启用分割按钮
-        self._segment_btn.setEnabled(self._model_loaded and pos_count > 0)
+        # 模型已加载且有正点时，启用分割按钮（批量进行中保持禁用）
+        self._segment_btn.setEnabled(
+            self._model_loaded and pos_count > 0 and not self._batch_mode)
         # 批量按钮：模型已加载且有已标点图片
         self._update_batch_btn()
 
     def _update_batch_btn(self):
-        """根据缓存的标点数量更新批量分割按钮（仅统计手动标注的图）。"""
+        """根据缓存的标点数量更新批量分割按钮。批量进行中保持禁用。"""
+        if self._batch_mode:
+            self._batch_btn.setEnabled(False)
+            return
         if self._model_loaded:
-            count = sum(1 for idx, pts in self._point_cache.items()
-                        if pts and self._is_manual.get(idx))
+            count = sum(1 for pts in self._point_cache.values()
+                        if pts and any(l == 1 for _, _, l in pts))
             self._batch_btn.setEnabled(count > 0)
         else:
             self._batch_btn.setEnabled(False)
@@ -1208,15 +1234,31 @@ class PointSelectionPanel(QWidget):
             tag="point_save_points",
         )
 
-    def _do_segment(self, batch: bool = False):
-        """执行多点分割请求。batch=True 时不修改按钮状态（由批量流程控制）。"""
-        if not self._project or self._current_idx < 0:
-            return
+    def _parse_result_idx(self, path: str) -> int:
+        """从结果图 URL 的 ?idx= 查询参数解析图片索引（无则回退当前索引）。"""
+        try:
+            if "?" in path:
+                qs = parse_qs(urlparse(path).query)
+                if "idx" in qs:
+                    return int(qs["idx"][0])
+        except (ValueError, KeyError, IndexError):
+            pass
+        return self._current_idx
+
+    def _do_segment(self, batch: bool = False) -> bool:
+        """执行多点分割请求。batch=True 时不修改按钮状态（由批量流程控制）。
+
+        batch=True 时生成 req_id 并启动看门狗，防止响应丢失导致批量卡死。
+        返回 True 表示已发出请求；False 表示未发出（批量调用方应继续推进）。
+        """
+        if (not self._project or self._current_idx < 0
+                or self._current_idx >= len(self._images)):
+            return False
 
         pts = self._left_canvas.points()
         if not pts:
             self._log_msg("⚠ 请先添加至少一个正点")
-            return
+            return False
 
         fname = self._images[self._current_idx]
         if not batch:
@@ -1226,11 +1268,20 @@ class PointSelectionPanel(QWidget):
         points_json = json.dumps(pts)
         self._log_msg(f"多点分割: {fname} @ {points_json}")
 
+        req_id = ""
+        if batch:
+            self._batch_seq += 1
+            req_id = f"batch-{self._batch_seq}"
+            self._batch_pending_id = req_id
+            self._batch_timer.start()
+
         self._api.post(
             f"/api/projects/{self._project}/sam/point-segment",
-            form_data={"filename": fname, "points": points_json},
+            form_data={"filename": fname, "points": points_json, "req_id": req_id},
             tag="point_segment",
+            meta={"req_id": req_id},  # 错误响应也带上 req_id，便于批量流程识别
         )
+        return True
 
     def _on_segment(self):
         """按钮触发的分割 — 使用所有已选点。"""
@@ -1250,30 +1301,34 @@ class PointSelectionPanel(QWidget):
         self._do_segment()
 
     def _on_batch_segment(self):
-        """批量分割：对所有已标点的图片依次执行分割。"""
+        """批量分割：对所有已标点的图片依次执行分割（一张一张自动传入模型）。
+
+        队列包含所有带正点的图片（手动标注与自动继承的都算），
+        分割成功后该图会标记为手动确认。
+        """
         if not self._model_loaded:
             self._log_msg("⚠ 请先加载 SAM 模型")
             return
 
-        # 先保存当前图片的点到缓存（仅手动标注的图）
-        if self._current_idx >= 0 and self._is_manual.get(self._current_idx, False):
+        # 先保存当前图片的点到缓存
+        if 0 <= self._current_idx < len(self._images):
             pts = self._left_canvas.points()
             self._point_cache[self._current_idx] = [list(p) for p in pts]
             if pts:
-                self._save_points_to_disk(self._current_idx)
                 self._last_manual_points = [list(p) for p in pts]
 
-        # 收集所有手动标注且带正点的图片索引（自动继承的图不参与，需用户手动确认）
+        # 收集所有带正点的图片索引（手动或继承）
         queue = sorted(idx for idx, pts in self._point_cache.items()
-                       if pts and self._is_manual.get(idx)
-                       and any(l == 1 for _, _, l in pts))
+                       if pts and any(l == 1 for _, _, l in pts))
         if not queue:
-            self._log_msg(f"⚠ 没有手动标注的图片（自动继承的点需手动点击确认后才计入）")
+            self._log_msg("⚠ 没有带正点的图片（请先在图片上左键添加正点）")
             return
 
         self._batch_queue = queue
         self._batch_total = len(queue)
         self._batch_done = 0
+        self._batch_seq = 0
+        self._batch_pending_id = ""
         self._batch_mode = True
         self._load_model_btn.setEnabled(False)
         self._segment_btn.setEnabled(False)
@@ -1282,39 +1337,34 @@ class PointSelectionPanel(QWidget):
         self._page_spin.setEnabled(False)
         self._prev_btn.setEnabled(False)
         self._next_btn.setEnabled(False)
+        self._proj_combo.setEnabled(False)
+        self._refresh_proj_btn.setEnabled(False)
         self._log_msg(f"📦 开始批量分割 {self._batch_total} 张图片 (idx={queue})")
         self._process_next_batch()
 
     def _process_next_batch(self):
-        """处理队列中的下一张图片。"""
+        """处理队列中的下一张图片（一张一张自动传入模型）。"""
+        if not self._batch_mode:
+            return
         if not self._batch_queue:
-            # 全部完成
-            self._batch_mode = False
-            self._batch_btn.setText("📦 批量分割")
-            self._update_batch_btn()
-            self._load_model_btn.setEnabled(True)
-            self._segment_btn.setEnabled(self._model_loaded)
-            self._page_spin.setEnabled(True)
-            self._prev_btn.setEnabled(True)
-            self._next_btn.setEnabled(True)
-            self._status_label.setText(f"✓ 批量完成 ({self._batch_total} 张)")
-            self._log_msg(f"✓ 批量分割完成 ({self._batch_total} 张)")
+            self._finish_batch()
             return
 
         idx = self._batch_queue.pop(0)
         self._batch_done += 1
-        self._status_label.setText(f"批量分割中... {self._batch_done}/{self._batch_total}")
-        self._log_msg(f"📦 [{self._batch_done}/{self._batch_total}] 准备分割 idx={idx}")
+        self._status_label.setText(
+            f"批量分割中... {self._batch_done}/{self._batch_total}")
+        self._log_msg(f"📦 [{self._batch_done}/{self._batch_total}] 分割 idx={idx}")
 
-        # 批量模式：直接切换索引并恢复标点，不等图片加载
+        # 缓存中无标点或索引越界 → 跳过
         pts = self._point_cache.get(idx, [])
-        if not pts:
-            self._log_msg(f"⚠ idx={idx} 缓存中无标点，跳过")
+        if not pts or idx < 0 or idx >= len(self._images):
+            self._log_msg(f"⚠ idx={idx} 无有效标点，跳过")
             self._process_next_batch()
             return
 
-        # 保存当前图片的点（仅手动标注的图）
-        if self._current_idx >= 0 and self._is_manual.get(self._current_idx, False):
+        # 保存当前图片的点到缓存
+        if 0 <= self._current_idx < len(self._images):
             cur_pts = self._left_canvas.points()
             self._point_cache[self._current_idx] = [list(p) for p in cur_pts]
             if cur_pts:
@@ -1336,8 +1386,35 @@ class PointSelectionPanel(QWidget):
         # 异步加载图片（仅用于显示，不影响分割）
         self._load_current_image()
 
-        # 触发分割
-        self._do_segment(batch=True)
+        # 触发分割；若未发出请求则继续下一张
+        sent = self._do_segment(batch=True)
+        if not sent:
+            self._process_next_batch()
+
+    def _finish_batch(self):
+        """批量结束：恢复界面状态。"""
+        self._batch_mode = False
+        self._batch_timer.stop()
+        self._batch_btn.setText("📦 批量分割")
+        self._load_model_btn.setEnabled(True)
+        self._page_spin.setEnabled(True)
+        self._prev_btn.setEnabled(True)
+        self._next_btn.setEnabled(True)
+        self._proj_combo.setEnabled(True)
+        self._refresh_proj_btn.setEnabled(True)
+        self._update_points_info()  # 恢复分割 / 批量按钮状态
+        self._status_label.setText(f"✓ 批量完成 ({self._batch_total} 张)")
+        self._log_msg(f"✓ 批量分割完成 ({self._batch_total} 张)")
+
+    def _on_batch_timeout(self):
+        """看门狗：某张图长时间无响应时跳过，避免批量卡死。
+
+        迟到的响应会因 req_id 不匹配而在 point_segment 响应处理里被忽略。
+        """
+        if not self._batch_mode:
+            return
+        self._log_msg("⚠ 分割响应超时，跳过当前图片")
+        self._process_next_batch()
 
     def _on_toggle_model(self):
         """Toggle between load and release."""
@@ -1446,9 +1523,11 @@ class PointSelectionPanel(QWidget):
                 pix = QPixmap()
                 pix.loadFromData(image_data)
                 self._left_canvas.set_image(pix)
-                self._status_label.setText(
-                    f"图片 {self._current_idx + 1}/{len(self._images)}"
-                )
+                # 批量进行中不覆盖进度提示
+                if not self._batch_mode:
+                    self._status_label.setText(
+                        f"图片 {self._current_idx + 1}/{len(self._images)}"
+                    )
                 # 图片加载完成后恢复该图的标点（缓存或磁盘）
                 self._restore_points_after_image_load()
                 if self._model_loaded and not self._batch_mode:
@@ -1486,6 +1565,9 @@ class PointSelectionPanel(QWidget):
         # ── 分割结果 ──
         elif tag == "point_segment":
             is_batch = self._batch_mode
+            req_id = payload.get("req_id", "")
+            # 批量模式下只处理属于当前批量项的响应（迟到的旧响应直接忽略）
+            is_current = (not is_batch) or (req_id == self._batch_pending_id)
             if not is_batch:
                 self._segment_btn.setEnabled(True)
                 self._segment_btn.setText("✂ 分割")
@@ -1494,7 +1576,7 @@ class PointSelectionPanel(QWidget):
                 if not is_batch:
                     self._status_label.setText("分割失败")
                     QMessageBox.warning(self, "分割失败", str(error))
-            else:
+            elif is_current:
                 resp_data = payload.get("data", {})
                 contour_path = resp_data.get("contour_path", "")
                 score = resp_data.get("score")
@@ -1509,7 +1591,7 @@ class PointSelectionPanel(QWidget):
                 else:
                     self._status_label.setText(f"✓ 分割完成 ({len(points_used)}点)")
                 # 缓存当前点集合并保存到磁盘（分割即确认 → 标记为手动）
-                if self._current_idx >= 0:
+                if 0 <= self._current_idx < len(self._images):
                     pts = self._left_canvas.points()
                     self._point_cache[self._current_idx] = [list(p) for p in pts]
                     self._is_manual[self._current_idx] = True
@@ -1518,16 +1600,17 @@ class PointSelectionPanel(QWidget):
                         self._last_manual_points = [list(p) for p in pts]
                     else:
                         self._last_manual_points = []
-                # 加载结果图 — 优先轮廓图
+                # 加载结果图 — 优先轮廓图（带上 idx，避免响应到达时索引已变）
                 if contour_path:
                     result_filename = Path(contour_path).name
                     self._api.fetch_image(
-                        f"/api/projects/{self._project}/sam/point-result/{result_filename}",
+                        f"/api/projects/{self._project}/sam/point-result/{result_filename}?idx={self._current_idx}",
                         tag="point_right_image",
                     )
 
-            # 批量模式：继续下一张
-            if is_batch:
+            # 批量模式：当前项已收到响应（成功或失败）→ 继续下一张
+            if is_batch and is_current:
+                self._batch_timer.stop()
                 self._process_next_batch()
 
         # ── 右图（分割结果）──
@@ -1537,8 +1620,9 @@ class PointSelectionPanel(QWidget):
                 pix = QPixmap()
                 pix.loadFromData(image_data)
                 self._right_canvas.set_image(pix)
-                if self._current_idx >= 0:
-                    self._result_cache[self._current_idx] = pix
+                ridx = self._parse_result_idx(path)
+                if 0 <= ridx < len(self._images):
+                    self._result_cache[ridx] = pix
 
     # ------------------------------------------------------------------
     # 辅助
