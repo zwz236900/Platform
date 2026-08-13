@@ -48,6 +48,7 @@ from modules.gs_runner import (
     GS_COMMANDS,
     build_gs_command,
     get_gs_process,
+    get_gs_run_status,
     is_gs_running,
     remove_gs_process,
     run_gs_async,
@@ -1505,7 +1506,7 @@ async def get_mvs_result(project_name: str, mvs_type: str = "openmvs"):
         return {
             "project_name": project_name,
             "ready": False,
-            "message": "No MVS results yet. Run MVS pipeline first.",
+            "message": "暂无 MVS 结果：尚未运行任何 MVS 命令，或该命令未生成结果文件。",
             "run_status": run_status,
             "exit_code": exit_code,
         }
@@ -1550,6 +1551,39 @@ async def get_mvs_result(project_name: str, mvs_type: str = "openmvs"):
         "run_status": run_status,
         "exit_code": exit_code,
     }
+
+
+@app.get("/api/projects/{project_name}/mvs/files")
+async def list_mvs_files(project_name: str, mvs_type: str = "openmvs"):
+    """List MVS 产物文件，按所属步骤标注，排除日志/结果描述等非产物。
+
+    每个产物带 step（来自哪一步）与 path（相对 MVS_output/<type>/ 的路径），
+    前端下拉框据此展示「步骤 · 文件」，而不是整目录倾倒。
+    """
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    mvs_dir = _mvs_output_dir(project_name, mvs_type)
+    products: list[dict] = []
+    if mvs_dir.is_dir():
+        # 文件名 → 步骤（顺序敏感：更具体的后缀先匹配）
+        for f in sorted(mvs_dir.iterdir()):
+            if not f.is_file():
+                continue
+            if f.name in ("mvs_pipeline.log", "mvs_pipeline_result.json"):
+                continue  # 日志 / 结果描述，不是可下载产物
+            step = "接口"
+            for key, label in (("texture", "纹理贴图"),
+                               ("refine", "网格精化"),
+                               ("mesh", "网格重建"),
+                               ("dense", "稠密化")):
+                if key in f.name:
+                    step = label
+                    break
+            products.append({"step": step, "label": f.name, "path": f.name})
+
+    return {"project_name": project_name, "products": products}
 
 
 @app.get("/api/projects/{project_name}/mvs/download/{filename:path}")
@@ -1696,8 +1730,16 @@ async def get_gs_log(project_name: str, lines: int = 100):
 
 @app.get("/api/projects/{project_name}/3dgs/result")
 async def get_gs_result(project_name: str):
-    """Get 3DGS pipeline result — list of rendered images."""
+    """Get 3DGS pipeline result — list of rendered images.
+
+    返回 run_status（running/ok/failed），前端据此判定完成并停止轮询，
+    不再只依赖 ready（prepare 等命令不产渲染图，ready 恒 False）。
+    """
     _check_gs_completion(project_name)
+
+    st = get_gs_run_status(project_name)
+    run_status = st.get("status", "idle") if st else "idle"
+    exit_code = (st or {}).get("exit_code")
 
     p = get_project(project_name)
     if p is None:
@@ -1709,7 +1751,9 @@ async def get_gs_result(project_name: str):
         return {
             "project_name": project_name,
             "ready": False,
-            "message": "No 3DGS results yet. Run 3DGS pipeline first.",
+            "run_status": run_status,
+            "exit_code": exit_code,
+            "message": "暂无 3DGS 结果：尚未运行任何 3DGS 命令。",
         }
 
     # Find the latest iteration directory
@@ -1746,12 +1790,79 @@ async def get_gs_result(project_name: str):
     return {
         "project_name": project_name,
         "ready": True,
+        "run_status": run_status,
+        "exit_code": exit_code,
         "renders_count": len(renders),
         "renders": renders,
         "iteration_name": iteration_name,
         "has_point_cloud": has_point_cloud,
         "point_cloud_ply": point_cloud_ply,
     }
+
+
+@app.get("/api/projects/{project_name}/3dgs/files")
+async def list_gs_files(project_name: str):
+    """列出 3DGS 产物，按步骤标注，只含真正可下载的产物。
+
+    训练 → 点云（各迭代）+ 检查点；渲染 → 渲染图（最新迭代，训练/测试集）。
+    排除 gt 原图、日志、输入与中间配置（cameras.json / cfg_args / input.ply 等），
+    不把整个 3DGS_output 目录倾倒给前端。
+    """
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    gs_dir = _gs_output_dir(project_name)
+    products: list[dict] = []
+    if not gs_dir.is_dir():
+        return {"project_name": project_name, "products": products}
+
+    # ── 训练：点云（各迭代，最新在前）──
+    pc_root = gs_dir / "point_cloud"
+    if pc_root.is_dir():
+        pc_dirs = [d for d in pc_root.iterdir()
+                   if d.is_dir() and d.name.startswith("iteration_")]
+        pc_dirs.sort(
+            key=lambda d: int(d.name.split("_")[1]), reverse=True)
+        for d in pc_dirs:
+            ply = d / "point_cloud.ply"
+            if ply.is_file():
+                products.append({
+                    "step": "训练",
+                    "label": f"点云（{d.name}）",
+                    "path": str(ply.relative_to(gs_dir)).replace(os.sep, "/"),
+                })
+
+    # ── 训练：检查点（最新在前）──
+    ckpts = sorted(
+        gs_dir.glob("chkpnt*.pth"),
+        key=lambda p: int(p.stem.replace("chkpnt", "")), reverse=True)
+    for ckpt in ckpts:
+        products.append({
+            "step": "训练",
+            "label": f"检查点（{ckpt.name}）",
+            "path": ckpt.name,
+        })
+
+    # ── 渲染：最新迭代的训练/测试集渲染图（排除 gt）──
+    for split, split_label in (("train", "训练集"), ("test", "测试集")):
+        split_root = gs_dir / split
+        if not split_root.is_dir():
+            continue
+        for ours in sorted(split_root.iterdir(), reverse=True):
+            if ours.is_dir() and ours.name.startswith("ours_"):
+                rdir = ours / "renders"
+                if rdir.is_dir():
+                    for png in sorted(rdir.iterdir()):
+                        if png.suffix.lower() == ".png":
+                            products.append({
+                                "step": "渲染",
+                                "label": f"{png.stem}（{split_label}）",
+                                "path": str(png.relative_to(gs_dir)).replace(os.sep, "/"),
+                            })
+                break  # 只取最新迭代
+
+    return {"project_name": project_name, "products": products}
 
 
 @app.get("/api/projects/{project_name}/3dgs/download/{filename:path}")

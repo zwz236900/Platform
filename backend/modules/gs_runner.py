@@ -105,6 +105,33 @@ def build_gs_command(
 
 _running_gs_processes: dict[str, subprocess.Popen] = {}
 
+# 最近一次 3DGS 运行的结果状态，keyed by project_name。
+# 前端据此判定完成（替代解析日志关键字 / 只看 ready），进程退出即落定，幂等。
+_gs_run_state: dict[str, dict] = {}
+
+
+def _finalize_gs_state(project_name: str, exit_code: int) -> None:
+    """记录一次 3DGS 运行的最终状态（进程退出时调用，幂等）。"""
+    _gs_run_state[project_name] = {
+        "status": "ok" if exit_code == 0 else "failed",
+        "exit_code": exit_code,
+    }
+
+
+def get_gs_run_status(project_name: str) -> dict | None:
+    """返回当前 3DGS 运行状态；本会话从未运行过返回 None。
+
+    - {"status": "running"}                       进程存活
+    - {"status": "ok"|"failed", "exit_code": int} 已结束
+    """
+    proc = _running_gs_processes.get(project_name)
+    if proc is not None and proc.poll() is None:
+        return {"status": "running"}
+    if proc is not None:
+        # 进程已退出而 _target 尚未落定状态（罕见竞态）→ 就地补齐
+        _finalize_gs_state(project_name, proc.returncode)
+    return _gs_run_state.get(project_name)
+
 
 def _ensure_gs_running() -> None:
     """调用前确保 gs3 容器在跑；未跑则 docker start（不常驻，随调用启动）。
@@ -148,6 +175,10 @@ def run_gs_async(
     # 调用即启动：确保 gs3 容器在跑（不常驻），失败则同步抛错
     _ensure_gs_running()
 
+    # 同步标记运行中：保证 POST 返回时，前端立即查询到 run_status=running，
+    # 不会误判为 idle 而提前停表（docker exec 启动可能慢于 join(0.1)）。
+    _gs_run_state[project_name] = {"status": "running", "exit_code": None}
+
     def _target():
         logger.info("Project %r: launching 3DGS docker exec...", project_name)
 
@@ -186,6 +217,8 @@ def run_gs_async(
 
             proc.wait()
             logger.info("Project %r: 3DGS docker exited with code %d", project_name, proc.returncode)
+            # 落定运行状态（幂等；get_gs_run_status 也会在观察到期时补齐）
+            _finalize_gs_state(project_name, proc.returncode)
 
             footer = f"\n{'='*60}\n=== 3DGS END {project_name} | exit_code: {proc.returncode}\n{'='*60}\n"
             proj_f.write(footer)

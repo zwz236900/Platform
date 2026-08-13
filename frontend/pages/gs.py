@@ -49,7 +49,7 @@ GS_COMMANDS = [
     ("render",  "渲染新视角"),
 ]
 
-# 各命令可用的参数（其余置灰）
+# 各命令可用的参数（其余按命令显隐，不摊开置灰）
 COMMAND_PARAMS = {
     "full": [
         "iterations", "resolution", "white_background", "quiet",
@@ -63,12 +63,11 @@ COMMAND_PARAMS = {
     "render": ["quiet"],
 }
 
-# 常见下载产物（位于 3DGS_output/ 下）
-COMMON_FILES = [
-    "point_cloud/iteration_30000/point_cloud.ply",
-    "point_cloud.ply",
-    "train/ours_30000/renders/xxx.png",
-]
+# 参数 → 所在 GroupBox 的归属（用于整组显隐）
+_PARAM_GROUPS = {
+    "left": ["iterations", "resolution", "checkpoint_interval", "start_checkpoint"],
+    "right": ["white_background", "quiet"],
+}
 
 STEP_LABELS = {"prepare": "准备", "train": "训练", "render": "渲染"}
 
@@ -129,6 +128,8 @@ class GsPage(BasePage):
         self._poll_timer.setInterval(3000)
         self._renders: list[str] = []
         self._current_render = 0
+        # 结果返回时点云路径已知，但文件列表是异步加载 → 先记下，列表就绪后选中
+        self._pending_pc_ply = ""
 
         # ── 项目选择 ──
         row = QHBoxLayout()
@@ -165,6 +166,39 @@ class GsPage(BasePage):
         self.command_combo.currentIndexChanged.connect(self._on_command_changed)
         cmd_form.addRow("命令:", self.command_combo)
         self.content_layout.addWidget(cmd_group)
+
+        # ── 渲染图预览（放在「渲染新视角」选项下面：只在选中该命令时显示）──
+        render_group = QGroupBox("渲染图预览")
+        rl = QVBoxLayout(render_group)
+
+        nav = QHBoxLayout()
+        nav.addWidget(QLabel("视角:"))
+        self.render_combo = QComboBox()
+        self.render_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.render_combo.currentIndexChanged.connect(self._on_render_selected)
+        nav.addWidget(self.render_combo, 1)
+        self.prev_btn = QPushButton("◀")
+        self.prev_btn.setObjectName("actionBtn")
+        self.prev_btn.setFixedSize(36, 28)
+        self.prev_btn.clicked.connect(lambda: self._step_render(-1))
+        nav.addWidget(self.prev_btn)
+        self.next_btn = QPushButton("▶")
+        self.next_btn.setObjectName("actionBtn")
+        self.next_btn.setFixedSize(36, 28)
+        self.next_btn.clicked.connect(lambda: self._step_render(1))
+        nav.addWidget(self.next_btn)
+        rl.addLayout(nav)
+
+        self.render_canvas = QLabel("（运行「渲染新视角」后在此展示渲染图）")
+        self.render_canvas.setObjectName("logArea")
+        self.render_canvas.setMinimumHeight(200)
+        self.render_canvas.setAlignment(Qt.AlignCenter)
+        self.render_canvas.setStyleSheet("color:#8b949e; font-size:12px;")
+        rl.addWidget(self.render_canvas)
+
+        self.content_layout.addWidget(render_group)
+        self.render_group = render_group
+        self.render_group.setVisible(False)
 
         # ── 参数设置 ──
         params = QHBoxLayout()
@@ -247,44 +281,12 @@ class GsPage(BasePage):
         self.result_label.setWordWrap(True)
         self.content_layout.addWidget(self.result_label)
 
-        # ── 渲染图预览 ──
-        render_group = QGroupBox("渲染图预览")
-        rl = QVBoxLayout(render_group)
-
-        nav = QHBoxLayout()
-        nav.addWidget(QLabel("视角:"))
-        self.render_combo = QComboBox()
-        self.render_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.render_combo.currentIndexChanged.connect(self._on_render_selected)
-        nav.addWidget(self.render_combo, 1)
-        self.prev_btn = QPushButton("◀")
-        self.prev_btn.setObjectName("actionBtn")
-        self.prev_btn.setFixedSize(36, 28)
-        self.prev_btn.clicked.connect(lambda: self._step_render(-1))
-        nav.addWidget(self.prev_btn)
-        self.next_btn = QPushButton("▶")
-        self.next_btn.setObjectName("actionBtn")
-        self.next_btn.setFixedSize(36, 28)
-        self.next_btn.clicked.connect(lambda: self._step_render(1))
-        nav.addWidget(self.next_btn)
-        rl.addLayout(nav)
-
-        self.render_canvas = QLabel("（运行后展示训练集渲染图）")
-        self.render_canvas.setObjectName("logArea")
-        self.render_canvas.setMinimumHeight(200)
-        self.render_canvas.setAlignment(Qt.AlignCenter)
-        self.render_canvas.setStyleSheet("color:#8b949e; font-size:12px;")
-        rl.addWidget(self.render_canvas)
-
-        self.content_layout.addWidget(render_group)
-
         # ── 下载区 ──
         dl_group = QGroupBox("下载产物")
         dl_form = QFormLayout(dl_group)
 
         dl_row = QHBoxLayout()
         self.dl_file_combo = QComboBox()
-        self.dl_file_combo.setEditable(True)
         self.dl_file_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         dl_row.addWidget(self.dl_file_combo, 1)
         dl_form.addRow("文件:", dl_row)
@@ -322,7 +324,7 @@ class GsPage(BasePage):
         self._log.setFont(QFont("Consolas", 9))
         self.content_layout.addWidget(self._log)
 
-        # 命令相关的参数启用/禁用
+        # 命令相关的参数（按命令整行显隐，不摊开置灰）
         self._param_widgets = {
             "iterations": self.iterations_spin,
             "resolution": self.resolution_spin,
@@ -331,6 +333,16 @@ class GsPage(BasePage):
             "checkpoint_interval": self.ckpt_spin,
             "start_checkpoint": self.start_ckpt_edit,
         }
+        # 记录每个参数在所属 QFormLayout 中的行号，整行显隐（避免 label 残留）
+        self._param_rows: dict[str, tuple] = {}
+        for key, w in self._param_widgets.items():
+            for form in (lform, rform):
+                row, _role = form.getWidgetPosition(w)
+                if row >= 0:
+                    self._param_rows[key] = (form, row)
+                    break
+        self.left_group = left_group
+        self.right_group = right_group
         self._on_command_changed()
 
     # ------------------------------------------------------------------
@@ -365,20 +377,43 @@ class GsPage(BasePage):
             self.project_combo.setCurrentIndex(-1)
 
     def _on_command_changed(self):
+        """只展示当前命令实际用到的参数（整行显隐，label 一起消失）。
+
+        prepare 无参数 → 两组全隐藏；render 只用 quiet → 选项组只留安静模式。
+        """
         cmd = self.command_combo.currentData() or "full"
         enabled = set(COMMAND_PARAMS.get(cmd, []))
-        for key, w in self._param_widgets.items():
-            w.setEnabled(key in enabled)
+
+        for key, (form, row) in self._param_rows.items():
+            form.setRowVisible(row, key in enabled)
+
+        # 分组外壳：组内没有任何可见参数时整组隐藏
+        for gname, group in (("left", self.left_group),
+                             ("right", self.right_group)):
+            group.setVisible(any(k in enabled for k in _PARAM_GROUPS[gname]))
+
+        # 渲染图预览只跟随「渲染新视角」命令（切到其它命令即收起）
+        self._update_render_preview()
+
+    def _update_render_preview(self):
+        """渲染图预览只属于「渲染新视角」选项：选中它才显示，切到其它命令就收起。
+
+        渲染图是渲染命令的产物，挂在渲染选项下面；在其它命令的设置界面里不该出现。
+        已有渲染结果时切回「渲染新视角」会自动展示。
+        """
+        cmd = self.command_combo.currentData() or "full"
+        visible = cmd == "render"
+        self.render_group.setVisible(visible)
+        if visible and self._renders and self.render_canvas.pixmap() is None:
+            self._load_render_image(0)
 
     def _update_download_files(self):
-        files = list(COMMON_FILES)
-        # 若有实际渲染图 / 点云路径，追加
-        if self._renders:
-            files = list(self._renders) + files
-        self.dl_file_combo.blockSignals(True)
-        self.dl_file_combo.clear()
-        self.dl_file_combo.addItems(files)
-        self.dl_file_combo.blockSignals(False)
+        """从后端读取 3DGS_output 下的真实文件，填入下载下拉框（与 MVS 一致）。"""
+        project = self._current_project or self.project_combo.currentText().strip()
+        if not project:
+            self.dl_file_combo.clear()
+            return
+        self._api.get(f"/api/projects/{project}/3dgs/files", tag="gs_files")
 
     # ------------------------------------------------------------------
     # 运行
@@ -471,9 +506,10 @@ class GsPage(BasePage):
         if not self._current_project:
             QMessageBox.warning(self, "提示", "请先选择一个项目。")
             return
-        filename = self.dl_file_combo.currentText().strip()
+        filename = self.dl_file_combo.currentData() \
+            or self.dl_file_combo.currentText().strip()
         if not filename:
-            QMessageBox.warning(self, "提示", "请填写要下载的文件名。")
+            QMessageBox.warning(self, "提示", "请选择要下载的产物。")
             return
 
         default_name = f"{self._current_project}_{Path(filename).name}"
@@ -542,15 +578,70 @@ class GsPage(BasePage):
                 if scrollbar:
                     scrollbar.setValue(scrollbar.maximum())
 
-        # ── 结果查询 ──
+        # ── 下载产物列表（按步骤标注，展示真实产物而非整目录）──
+        elif tag == "gs_files":
+            if error:
+                self._dl_status.setText(f"读取产物失败: {error}")
+                return
+            products = payload.get("products", [])
+            self.dl_file_combo.blockSignals(True)
+            self.dl_file_combo.clear()
+            for item in products:
+                self.dl_file_combo.addItem(
+                    f"{item['step']} · {item['label']}", item["path"])
+            self.dl_file_combo.blockSignals(False)
+            self._dl_status.setText("暂无产物可下载" if not products else "")
+            # 结果里已知的点云路径，等列表加载完后自动选中
+            if self._pending_pc_ply:
+                idx = self.dl_file_combo.findData(self._pending_pc_ply)
+                if idx >= 0:
+                    self.dl_file_combo.setCurrentIndex(idx)
+                self._pending_pc_ply = ""
+
+        # ── 结果查询（含后端运行状态，据此判定完成）──
         elif tag == "gs_result":
             if error:
                 self.result_label.setText(f"⚠ 查询结果失败: {error}")
                 return
+            run_status = payload.get("run_status")
+            exit_code = payload.get("exit_code")
+
+            # 运行中：以后端 run_status 判定完成，替代只盯 ready（prepare 等不产渲染图）
+            if self._running:
+                if run_status == "running":
+                    self._status_label.setText("3DGS 运行中...")
+                    return
+                # 进程已结束（ok/failed）：停止轮询、收起转圈
+                self._set_running(False)
+                self._poll_timer.stop()
+                if run_status == "ok":
+                    self._log_msg("✓ 3DGS 进程正常退出")
+                    self._status_label.setText("3DGS 已结束")
+                elif run_status == "failed":
+                    self._log_msg(f"✗ 3DGS 进程异常退出 (exit_code: {exit_code})")
+                    self._status_label.setText("3DGS 失败")
+                else:
+                    # idle：状态缺失（后端重启等）→ 保守停止，避免无限轮询
+                    self._log_msg("⚠ 3DGS 运行状态丢失，已停止轮询")
+                    self._status_label.setText("3DGS 状态未知")
+                    return
+
+            # 失败优先展示失败信息（即使结果文件缺失或残留旧产物）
+            if run_status == "failed":
+                msg = "❌ 3DGS 进程异常退出"
+                if exit_code is not None:
+                    msg += f" (exit_code: {exit_code})"
+                self.result_label.setText(msg)
+                self._update_render_preview()
+                return
+
             ready = payload.get("ready", False)
             if not ready:
                 msg = payload.get("message", "暂无 3DGS 结果。")
+                if run_status == "ok":
+                    msg = "✅ 命令已完成，暂无可展示的渲染结果（prepare 等数据准备命令属正常）。"
                 self.result_label.setText(f"ℹ {msg}")
+                self._update_render_preview()
                 return
 
             renders = payload.get("renders", [])
@@ -566,7 +657,7 @@ class GsPage(BasePage):
                 lines.append(f"   点云文件: {pc_ply}")
             self.result_label.setText("\n".join(lines))
 
-            # 更新渲染图列表
+            # 更新渲染图列表（预览区只在有渲染结果时显示）
             self._renders = renders
             self._current_render = 0
             self.render_combo.blockSignals(True)
@@ -576,13 +667,11 @@ class GsPage(BasePage):
             self.render_combo.blockSignals(False)
             if renders:
                 self._load_render_image(0)
+            self._update_render_preview()
 
-            # 刷新下载列表
+            # 刷新下载列表（异步加载真实文件，点云路径交给 gs_files 就绪后选中）
+            self._pending_pc_ply = pc_ply or ""
             self._update_download_files()
-            if pc_ply:
-                idx = self.dl_file_combo.findText(pc_ply)
-                if idx >= 0:
-                    self.dl_file_combo.setCurrentIndex(idx)
 
     # ------------------------------------------------------------------
     # 图片加载完成

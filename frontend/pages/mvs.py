@@ -46,14 +46,16 @@ MVS_TYPES = [
 ]
 
 # 命令（value 与后端 MVSCommand 枚举一致）
+# 按实际运行步骤排序：interface 等单步命令可直接使用，无需先跑 pipeline；
+# 完整流程 pipeline 放在最后作为一键方案。
 MVS_COMMANDS = [
-    ("pipeline",    "完整流程 pipeline"),
     ("interface",   "导入 interface"),
     ("densify",     "稠密重建 densify"),
     ("reconstruct", "表面重建 reconstruct"),
     ("refine",      "网格细化 refine"),
     ("texture",     "纹理映射 texture"),
     ("check",       "检查 check"),
+    ("pipeline",    "完整流程 pipeline"),
 ]
 
 # COLMAP 引擎不支持单步（后端恒跑 mvs，复用 SfM 去畸变输出；无去畸变时自动补 undistort）
@@ -61,7 +63,7 @@ MVS_COMMANDS_COLMAP = [
     ("pipeline", "完整流程（稠密重建）"),
 ]
 
-# 各命令可用的参数（其余置灰）
+# 各命令可用的参数
 COMMAND_PARAMS = {
     "pipeline": [
         "model", "resolution_level", "max_resolution", "min_resolution",
@@ -76,24 +78,12 @@ COMMAND_PARAMS = {
     "check":     [],
 }
 
-# 常见输出产物（用于下载）— 按引擎区分，各自位于 MVS_output/<type>/ 下
-COMMON_FILES = {
-    "openmvs": [
-        "scene.mvs",
-        "scene_dense.mvs",
-        "scene_dense.ply",
-        "scene_dense_mesh.mvs",
-        "scene_dense_mesh.ply",
-        "scene_dense_mesh_refine.mvs",
-        "scene_dense_mesh_refine.ply",
-        "scene_dense_mesh_refine_texture.mvs",
-        "scene_dense_mesh_refine_texture.ply",
-        "scene_dense_mesh_refine_texture.png",
-    ],
-    "colmap": [
-        "fused.ply",
-        "fused_del.ply",
-    ],
+# 参数 → 所在 GroupBox 的归属（用于整组显隐）
+_PARAM_GROUPS = {
+    "left": ["resolution_level", "max_resolution", "min_resolution",
+             "refine_resolution", "texture_resolution"],
+    "right": ["number_views", "scales", "gradient_step", "model", "export_type"],
+    "gpu": ["no_cuda"],
 }
 
 STEP_LABELS = {
@@ -249,6 +239,7 @@ class MvsPage(BasePage):
         lform.addRow("纹理级别:", self.texture_res_spin)
 
         params.addWidget(left_group)
+        self.left_group = left_group  # OpenMVS 专属：分辨率参数
 
         # 右列：深度与选项
         right_group = QGroupBox("深度与选项")
@@ -273,14 +264,6 @@ class MvsPage(BasePage):
         self.gradient_spin.setToolTip("gradient-step：纹理梯度步长")
         rform.addRow("梯度步长:", self.gradient_spin)
 
-        self.no_cuda_check = QCheckBox("CPU 模式（当前构建无 GPU 加速）")
-        self.no_cuda_check.setChecked(True)
-        self.no_cuda_check.setToolTip(
-            "openmvs 容器内为 2019 年 CPU-only 构建（未编译 CUDA），\n"
-            "此开关仅透传 --no-cuda 标记，暂不影响实际运行结果。"
-        )
-        rform.addRow("", self.no_cuda_check)
-
         self.model_edit = QLineEdit()
         self.model_edit.setText("0")
         self.model_edit.setPlaceholderText("模型编号，如 0")
@@ -293,6 +276,21 @@ class MvsPage(BasePage):
         rform.addRow("导出格式:", self.export_combo)
 
         params.addWidget(right_group)
+        self.right_group = right_group  # OpenMVS 专属：深度与选项
+
+        # GPU 开关：两个引擎共用。colmap 模式下隐藏上面两组 OpenMVS 参数，
+        # 只保留此开关（colmap 带 CUDA，no_cuda = 回退 CPU）。
+        gpu_group = QGroupBox("GPU 选项")
+        gform = QFormLayout(gpu_group)
+        self.no_cuda_check = QCheckBox("CPU 模式（当前构建无 GPU 加速）")
+        self.no_cuda_check.setChecked(True)
+        self.no_cuda_check.setToolTip(
+            "openmvs 容器内为 2019 年 CPU-only 构建（未编译 CUDA），\n"
+            "此开关仅透传 --no-cuda 标记，暂不影响实际运行结果。"
+        )
+        gform.addRow(self.no_cuda_check)
+        params.addWidget(gpu_group)
+        self.gpu_group = gpu_group
 
         self.content_layout.addLayout(params)
 
@@ -340,7 +338,6 @@ class MvsPage(BasePage):
         dl_type_row.addWidget(self.dl_type_combo)
 
         self.dl_file_combo = QComboBox()
-        self.dl_file_combo.setEditable(True)
         self.dl_file_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         dl_type_row.addWidget(self.dl_file_combo, 1)
         dl_form.addRow("文件:", dl_type_row)
@@ -392,6 +389,15 @@ class MvsPage(BasePage):
             "texture_resolution": self.texture_res_spin,
             "export_type": self.export_combo,
         }
+        # 记录每个参数在所属 QFormLayout 中的行号，用于整行显隐——
+        # 只 setVisible(False) 字段会让 label 文字残留，需 setRowVisible 连 label 一起隐藏。
+        self._param_rows: dict[str, tuple] = {}
+        for key, w in self._param_widgets.items():
+            for form in (lform, rform, gform):
+                row, _role = form.getWidgetPosition(w)
+                if row >= 0:
+                    self._param_rows[key] = (form, row)
+                    break
         self._on_command_changed()
 
     # ------------------------------------------------------------------
@@ -407,6 +413,7 @@ class MvsPage(BasePage):
         self._current_project = project
         if project:
             self._check_result()
+        self._update_download_files()
 
     def _on_shared_project_changed(self, project: str):
         """其余页面选中了项目 → 同步本页下拉框。
@@ -426,7 +433,11 @@ class MvsPage(BasePage):
             self.project_combo.setCurrentIndex(-1)
 
     def _repopulate_commands(self):
-        """按当前引擎重填命令下拉框：colmap 只保留完整流程。"""
+        """按当前引擎重填命令下拉框：colmap 只保留完整流程。
+
+        首次加载或原选中项不在当前引擎列表时，默认选「完整流程 pipeline」；
+        其余情况保留之前选中的单步命令。
+        """
         commands = MVS_COMMANDS_COLMAP if self._current_mvs_type == "colmap" else MVS_COMMANDS
         previous = self.command_combo.currentData()
         self.command_combo.blockSignals(True)
@@ -434,6 +445,8 @@ class MvsPage(BasePage):
         for value, label in commands:
             self.command_combo.addItem(label, value)
         idx = self.command_combo.findData(previous)
+        if idx < 0:
+            idx = self.command_combo.findData("pipeline")
         if idx >= 0:
             self.command_combo.setCurrentIndex(idx)
         self.command_combo.blockSignals(False)
@@ -445,7 +458,8 @@ class MvsPage(BasePage):
         self._repopulate_commands()
         if self._current_mvs_type == "openmvs":
             self._engine_hint.setText(
-                "OpenMVS: 基于 SfM 结果运行稠密重建流程；COLMAP: 复用 SfM 去畸变输出 + patch_match 稠密重建。"
+                "OpenMVS: 基于 SfM 结果运行稠密重建，单步命令（interface→densify→…）可直接执行，无需先跑完整流程；"
+                "COLMAP: 复用 SfM 去畸变输出 + patch_match 稠密重建。"
             )
             # openmvs 容器内为 2019 年 CPU-only 构建，GPU 开关无意义 → 默认 CPU 模式
             self.no_cuda_check.setText("CPU 模式（当前构建无 GPU 加速）")
@@ -482,21 +496,34 @@ class MvsPage(BasePage):
         self._update_download_files()
 
     def _update_download_files(self):
+        """从后端读取 MVS_output/<type>/ 里实际存在的文件，填充下载下拉框。"""
         mvs_type = self.dl_type_combo.currentData() or "openmvs"
-        files = COMMON_FILES.get(mvs_type, [])
-        self.dl_file_combo.blockSignals(True)
-        self.dl_file_combo.clear()
-        self.dl_file_combo.addItems(files)
-        self.dl_file_combo.blockSignals(False)
+        project = self._current_project or self.project_combo.currentText().strip()
+        if not project:
+            self.dl_file_combo.clear()
+            return
+        self._api.get(
+            f"/api/projects/{project}/mvs/files?mvs_type={mvs_type}",
+            tag="mvs_files",
+        )
 
     def _on_command_changed(self):
         cmd = self.command_combo.currentData() or "pipeline"
         enabled = set(COMMAND_PARAMS.get(cmd, []))
-        # colmap 引擎只认 no_cuda（GPU 开关），其余参数后端不接收 → 置灰
-        if self._current_mvs_type == "colmap":
-            enabled &= {"no_cuda"}
-        for key, w in self._param_widgets.items():
-            w.setEnabled(key in enabled)
+        is_colmap = self._current_mvs_type == "colmap"
+
+        # 只展示当前命令实际用到的参数（openmvs 按命令显隐，colmap 只留 GPU 开关），
+        # 不再把全部参数摊开再置灰。整行隐藏（含 label），避免「输入框没了、文字还在」。
+        visible = {"no_cuda"} if is_colmap else enabled
+
+        for key, (form, row) in self._param_rows.items():
+            form.setRowVisible(row, key in visible)
+
+        # 分组外壳：组内没有任何可见参数时整组隐藏（如 interface 只留模型、reconstruct 无参数）
+        for gname, group in (("left", self.left_group),
+                             ("right", self.right_group),
+                             ("gpu", self.gpu_group)):
+            group.setVisible(any(k in visible for k in _PARAM_GROUPS[gname]))
 
     # ------------------------------------------------------------------
     # 运行
@@ -569,9 +596,10 @@ class MvsPage(BasePage):
         if not self._current_project:
             QMessageBox.warning(self, "提示", "请先选择一个项目。")
             return
-        filename = self.dl_file_combo.currentText().strip()
+        filename = self.dl_file_combo.currentData() \
+            or self.dl_file_combo.currentText().strip()
         if not filename:
-            QMessageBox.warning(self, "提示", "请填写要下载的文件名。")
+            QMessageBox.warning(self, "提示", "请选择要下载的产物。")
             return
         mvs_type = self.dl_type_combo.currentData() or ""
 
@@ -646,6 +674,20 @@ class MvsPage(BasePage):
                 scrollbar = self._log.verticalScrollBar()
                 if scrollbar:
                     scrollbar.setValue(scrollbar.maximum())
+
+        # ── 下载产物列表（按步骤标注，展示真实产物而非整目录）──
+        elif tag == "mvs_files":
+            if error:
+                self._dl_status.setText(f"加载产物列表失败: {error}")
+                return
+            products = payload.get("products", [])
+            self.dl_file_combo.blockSignals(True)
+            self.dl_file_combo.clear()
+            for item in products:
+                self.dl_file_combo.addItem(
+                    f"{item['step']} · {item['label']}", item["path"])
+            self.dl_file_combo.blockSignals(False)
+            self._dl_status.setText("暂无产物可下载" if not products else "")
 
         # ── 结果查询（含后端运行状态，据此判定完成）──
         elif tag == "mvs_result":
