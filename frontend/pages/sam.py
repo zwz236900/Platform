@@ -26,6 +26,7 @@ from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkRe
 from PySide6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QMouseEvent, QPaintEvent
 
 from .base_page import BasePage
+from state import ProjectState, fill_project_combo
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -358,6 +359,8 @@ class BoxSelectionPanel(QWidget):
         super().__init__(parent)
         self._api = SamApiClient.instance()
         self._api.finished.connect(self._on_response)
+        self._state = ProjectState.instance()
+        self._state.current_changed.connect(self._on_shared_project_changed)
 
         self._project = ""
         self._images: list[str] = []
@@ -485,12 +488,14 @@ class BoxSelectionPanel(QWidget):
         self._log.setFont(QFont("Consolas", 9))
         layout.addWidget(self._log)
 
-        # 启动
-        self._load_projects()
+    # ------------------------------------------------------------------
+    # 显示 / 键盘切换图片
+    # ------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # 键盘切换图片
-    # ------------------------------------------------------------------
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 进入页面时重新拉取列表，让「别处选中的项目」也能同步到下拉框
+        self._load_projects()
 
     def eventFilter(self, obj, event):
         if obj is self._left_canvas and event.type() == QEvent.Type.KeyPress:
@@ -511,6 +516,7 @@ class BoxSelectionPanel(QWidget):
         self._api.get("/api/projects", tag="box_list_projects")
 
     def _on_project_changed(self, project: str):
+        self._state.set_current(project)
         if project == self._project:
             return
         self._project = project
@@ -524,6 +530,17 @@ class BoxSelectionPanel(QWidget):
         if project:
             self._status_label.setText("加载图片列表...")
             self._api.get(f"/api/projects/{project}/images/list", tag="box_list_images")
+
+    def _on_shared_project_changed(self, project: str):
+        """其余页面选中了项目 → 同步本页下拉框。"""
+        if self._proj_combo.currentText() == project:
+            return
+        if project:
+            idx = self._proj_combo.findText(project)
+            if idx >= 0:
+                self._proj_combo.setCurrentIndex(idx)
+        else:
+            self._proj_combo.setCurrentIndex(-1)
 
     # ------------------------------------------------------------------
     # 图片导航
@@ -688,16 +705,11 @@ class BoxSelectionPanel(QWidget):
                 self._status_label.setText(f"加载项目失败: {error}")
                 return
             projects = payload.get("projects", [])
-            cur = self._proj_combo.currentText()
-            self._proj_combo.blockSignals(True)
-            self._proj_combo.clear()
-            for p in projects:
-                self._proj_combo.addItem(p.get("project_name", ""))
-            if cur:
-                idx = self._proj_combo.findText(cur)
-                if idx >= 0:
-                    self._proj_combo.setCurrentIndex(idx)
-            self._proj_combo.blockSignals(False)
+            previous = self._proj_combo.currentText()
+            selected = fill_project_combo(self._proj_combo, projects)
+            # fill 期间屏蔽了信号：若全局选中项与下拉框现值不同，手动触发加载
+            if selected != previous:
+                self._on_project_changed(selected)
 
         # ── 图片列表 ──
         elif tag == "box_list_images":
@@ -823,6 +835,8 @@ class PointSelectionPanel(QWidget):
         super().__init__(parent)
         self._api = SamApiClient.instance()
         self._api.finished.connect(self._on_response)
+        self._state = ProjectState.instance()
+        self._state.current_changed.connect(self._on_shared_project_changed)
 
         # 状态
         self._project: str = ""
@@ -958,12 +972,14 @@ class PointSelectionPanel(QWidget):
         self._log.setFont(QFont("Consolas", 9))
         layout.addWidget(self._log)
 
-        # 启动
-        self._load_projects()
+    # ------------------------------------------------------------------
+    # 显示 / 键盘导航
+    # ------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # 键盘导航
-    # ------------------------------------------------------------------
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 进入页面时重新拉取列表，让「别处选中的项目」也能同步到下拉框
+        self._load_projects()
 
     def eventFilter(self, obj, event):
         if obj is self._left_canvas and event.type() == QEvent.Type.KeyPress:
@@ -985,7 +1001,8 @@ class PointSelectionPanel(QWidget):
         self._api.get("/api/projects", tag="point_list_projects")
 
     def _on_project_changed(self, project: str):
-        if not project or project == self._project:
+        self._state.set_current(project)
+        if project == self._project:
             return
         self._project = project
         self._images.clear()
@@ -1002,8 +1019,28 @@ class PointSelectionPanel(QWidget):
         self._total_label.setText("张")
         self._point_info_label.setText("")
         self._status_label.setText("加载图片列表中...")
-        self._log_msg(f"切换项目: {project}")
-        self._api.get(f"/api/projects/{project}/images/list", tag="point_list_images")
+        if project:
+            self._log_msg(f"切换项目: {project}")
+            self._api.get(
+                f"/api/projects/{project}/images/list",
+                tag="point_list_images",
+            )
+
+    def _on_shared_project_changed(self, project: str):
+        """其余页面选中了项目 → 同步本页下拉框。
+
+        批量分割进行中不跟随：避免切页选择打断正在推进的批量队列。
+        """
+        if self._batch_mode:
+            return
+        if self._proj_combo.currentText() == project:
+            return
+        if project:
+            idx = self._proj_combo.findText(project)
+            if idx >= 0:
+                self._proj_combo.setCurrentIndex(idx)
+        else:
+            self._proj_combo.setCurrentIndex(-1)
 
     def _on_page_spin(self, num: int):
         idx = num - 1
@@ -1346,17 +1383,12 @@ class PointSelectionPanel(QWidget):
                 self._log_msg(f"✗ 获取项目失败: {error}")
                 return
             projects = payload.get("projects", [])
-            current = self._proj_combo.currentText()
-            self._proj_combo.blockSignals(True)
-            self._proj_combo.clear()
-            for p in projects:
-                self._proj_combo.addItem(p.get("name", p.get("project_name", "")))
-            if current:
-                idx = self._proj_combo.findText(current)
-                if idx >= 0:
-                    self._proj_combo.setCurrentIndex(idx)
-            self._proj_combo.blockSignals(False)
+            previous = self._proj_combo.currentText()
+            selected = fill_project_combo(self._proj_combo, projects)
             self._log_msg(f"✓ 加载了 {len(projects)} 个项目")
+            # fill 期间屏蔽了信号：若全局选中项与下拉框现值不同，手动触发加载
+            if selected != previous:
+                self._on_project_changed(selected)
 
         # ── 图片列表 ──
         elif tag == "point_list_images":

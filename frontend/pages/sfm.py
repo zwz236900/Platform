@@ -25,6 +25,7 @@ from PySide6.QtGui import QFont
 
 from .base_page import BasePage
 from .projects import ApiClient
+from state import ProjectState, fill_project_combo
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -53,6 +54,8 @@ class SfMPage(BasePage):
 
         self._api = ApiClient.instance()
         self._api.finished.connect(self._on_response)
+        self._state = ProjectState.instance()
+        self._state.current_changed.connect(self._on_shared_project_changed)
         self._running = False
         self._current_project = ""
         self._poll_timer = QTimer(self)
@@ -66,6 +69,7 @@ class SfMPage(BasePage):
         self.project_combo = QComboBox()
         self.project_combo.setMinimumWidth(220)
         self.project_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.project_combo.currentTextChanged.connect(self._on_project_changed)
         row1.addWidget(self.project_combo)
 
         self._refresh_btn = QPushButton("🔄 刷新")
@@ -186,9 +190,6 @@ class SfMPage(BasePage):
         self._log.setFont(QFont("Consolas", 10))
         self.content_layout.addWidget(self._log, 1)
 
-        # ── 启动 ──
-        self._load_projects()
-
     # ------------------------------------------------------------------
     # 项目列表
     # ------------------------------------------------------------------
@@ -196,6 +197,28 @@ class SfMPage(BasePage):
     def _load_projects(self):
         self._refresh_btn.setEnabled(False)
         self._api.get("/api/projects", tag="list_sfm_projects")
+
+    def _on_project_changed(self, project: str):
+        """下拉框变化（用户选择 / 共享同步）→ 广播到全局。"""
+        self._state.set_current(project)
+        self._current_project = project
+
+    def _on_shared_project_changed(self, project: str):
+        """其余页面选中了项目 → 同步本页下拉框。
+
+        运行中不跟随：Pipeline 在后台跑时，_current_project 决定轮询目标，
+        不能被切页选择改掉。
+        """
+        if self._running:
+            return
+        if self.project_combo.currentText() == project:
+            return
+        if project:
+            idx = self.project_combo.findText(project)
+            if idx >= 0:
+                self.project_combo.setCurrentIndex(idx)
+        else:
+            self.project_combo.setCurrentIndex(-1)
 
     # ------------------------------------------------------------------
     # 启动 Pipeline
@@ -293,16 +316,11 @@ class SfMPage(BasePage):
             if error:
                 return
             projects = payload.get("projects", [])
-            current = self.project_combo.currentText()
-            self.project_combo.clear()
-            selected_idx = -1
-            for i, p in enumerate(projects):
-                pn = p.get("project_name", "")
-                self.project_combo.addItem(pn)
-                if pn == current:
-                    selected_idx = i
-            if selected_idx >= 0:
-                self.project_combo.setCurrentIndex(selected_idx)
+            previous = self.project_combo.currentText()
+            selected = fill_project_combo(self.project_combo, projects)
+            # fill 期间屏蔽了信号：若全局选中项与下拉框现值不同，手动同步 _current_project
+            if selected != previous:
+                self._on_project_changed(selected)
 
         # ── Pipeline 启动响应 ──
         elif tag == "run_pipeline":

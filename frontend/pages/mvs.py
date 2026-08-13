@@ -35,6 +35,7 @@ from PySide6.QtGui import QFont
 
 from .base_page import BasePage
 from .projects import ApiClient
+from state import ProjectState, fill_project_combo
 
 API_BASE = "http://localhost:8000"
 
@@ -53,6 +54,11 @@ MVS_COMMANDS = [
     ("refine",      "网格细化 refine"),
     ("texture",     "纹理映射 texture"),
     ("check",       "检查 check"),
+]
+
+# COLMAP 引擎不支持单步（后端恒跑 undistort + mvs，command 参数被忽略）→ 只保留完整流程
+MVS_COMMANDS_COLMAP = [
+    ("pipeline", "完整流程（去畸变 + 稠密重建）"),
 ]
 
 # 各命令可用的参数（其余置灰）
@@ -147,6 +153,8 @@ class MvsPage(BasePage):
 
         self._api = ApiClient.instance()
         self._api.finished.connect(self._on_response)
+        self._state = ProjectState.instance()
+        self._state.current_changed.connect(self._on_shared_project_changed)
 
         # 独立下载管理器（二进制下载，避免干扰 JSON 解析）
         self._dl_mgr = QNetworkAccessManager(self)
@@ -158,9 +166,6 @@ class MvsPage(BasePage):
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._poll_log)
         self._poll_timer.setInterval(3000)
-        self._poll_count = 0
-        self._finished_seen = False
-        self._current_run_started = False
 
         # ── 项目选择 ──
         row = QHBoxLayout()
@@ -268,7 +273,12 @@ class MvsPage(BasePage):
         self.gradient_spin.setToolTip("gradient-step：纹理梯度步长")
         rform.addRow("梯度步长:", self.gradient_spin)
 
-        self.no_cuda_check = QCheckBox("禁用 CUDA（CPU 模式）")
+        self.no_cuda_check = QCheckBox("CPU 模式（当前构建无 GPU 加速）")
+        self.no_cuda_check.setChecked(True)
+        self.no_cuda_check.setToolTip(
+            "openmvs 容器内为 2019 年 CPU-only 构建（未编译 CUDA），\n"
+            "此开关仅透传 --no-cuda 标记，暂不影响实际运行结果。"
+        )
         rform.addRow("", self.no_cuda_check)
 
         self.model_edit = QLineEdit()
@@ -384,9 +394,6 @@ class MvsPage(BasePage):
         }
         self._on_command_changed()
 
-        # ── 启动 ──
-        self._load_projects()
-
     # ------------------------------------------------------------------
     # 项目 / 引擎 / 命令
     # ------------------------------------------------------------------
@@ -396,17 +403,67 @@ class MvsPage(BasePage):
         self._api.get("/api/projects", tag="mvs_list_projects")
 
     def _on_project_changed(self, project: str):
+        self._state.set_current(project)
         self._current_project = project
         if project:
             self._check_result()
 
+    def _on_shared_project_changed(self, project: str):
+        """其余页面选中了项目 → 同步本页下拉框。
+
+        运行中不跟随：MVS 在后台跑时，_current_project 决定轮询目标，
+        不能被切页选择改掉。
+        """
+        if self._running:
+            return
+        if self.project_combo.currentText() == project:
+            return
+        if project:
+            idx = self.project_combo.findText(project)
+            if idx >= 0:
+                self.project_combo.setCurrentIndex(idx)
+        else:
+            self.project_combo.setCurrentIndex(-1)
+
+    def _repopulate_commands(self):
+        """按当前引擎重填命令下拉框：colmap 只保留完整流程。"""
+        commands = MVS_COMMANDS_COLMAP if self._current_mvs_type == "colmap" else MVS_COMMANDS
+        previous = self.command_combo.currentData()
+        self.command_combo.blockSignals(True)
+        self.command_combo.clear()
+        for value, label in commands:
+            self.command_combo.addItem(label, value)
+        idx = self.command_combo.findData(previous)
+        if idx >= 0:
+            self.command_combo.setCurrentIndex(idx)
+        self.command_combo.blockSignals(False)
+        self._on_command_changed()
+
     def _on_mvs_type_changed(self):
         self._current_mvs_type = self.mvs_type_combo.currentData()
-        self._engine_hint.setText(
-            "OpenMVS: 基于 SfM 结果运行稠密重建流程；COLMAP: 去畸变 + patch_match 稠密重建。"
-            if self._current_mvs_type == "openmvs"
-            else "COLMAP MVS: 执行去畸变(undistort)与稠密重建(mvs)，输出到 MVS_output/colmap。"
-        )
+        # 命令按引擎过滤：colmap 不支持单步，只保留完整流程
+        self._repopulate_commands()
+        if self._current_mvs_type == "openmvs":
+            self._engine_hint.setText(
+                "OpenMVS: 基于 SfM 结果运行稠密重建流程；COLMAP: 去畸变 + patch_match 稠密重建。"
+            )
+            # openmvs 容器内为 2019 年 CPU-only 构建，GPU 开关无意义 → 默认 CPU 模式
+            self.no_cuda_check.setText("CPU 模式（当前构建无 GPU 加速）")
+            self.no_cuda_check.setToolTip(
+                "openmvs 容器内为 2019 年 CPU-only 构建（未编译 CUDA），\n"
+                "此开关仅透传 --no-cuda 标记，暂不影响实际运行结果。"
+            )
+            self.no_cuda_check.setChecked(True)
+        else:
+            self._engine_hint.setText(
+                "COLMAP MVS: 执行去畸变(undistort)与稠密重建(mvs)，输出到 MVS_output/colmap。"
+            )
+            # colmap 4.2 带 CUDA → 默认启用 GPU
+            self.no_cuda_check.setText("禁用 GPU（CPU 模式）")
+            self.no_cuda_check.setToolTip(
+                "colmap 为带 CUDA 构建，勾选后 patch_match 等步骤回退 CPU。"
+            )
+            self.no_cuda_check.setChecked(False)
         # 同步下载区的引擎与文件列表
         self._sync_download_engine()
         if self._current_project:
@@ -434,6 +491,9 @@ class MvsPage(BasePage):
     def _on_command_changed(self):
         cmd = self.command_combo.currentData() or "pipeline"
         enabled = set(COMMAND_PARAMS.get(cmd, []))
+        # colmap 引擎只认 no_cuda（GPU 开关），其余参数后端不接收 → 置灰
+        if self._current_mvs_type == "colmap":
+            enabled &= {"no_cuda"}
         for key, w in self._param_widgets.items():
             w.setEnabled(key in enabled)
 
@@ -467,13 +527,11 @@ class MvsPage(BasePage):
         }
 
         self._current_project = project
-        self._finished_seen = False
-        self._current_run_started = False
         self._set_running(True)
         self._status_label.setText("MVS 启动中...")
         self.result_label.setText("⏳ 正在启动 MVS 任务...")
         self._log_msg(f"▶ 启动 MVS — 项目: {project} | 引擎: {mvs_type} | 命令: {command}")
-        self._log_msg(f"  导出格式: {config['export_type']}, CUDA: {str(not config['no_cuda'] == 'true')}")
+        self._log_msg(f"  导出格式: {config['export_type']}, 计算: {'CPU' if config['no_cuda'] == 'true' else 'GPU'}")
 
         self._api.post(
             f"/api/projects/{project}/mvs/run",
@@ -489,14 +547,12 @@ class MvsPage(BasePage):
         if not self._current_project:
             self._poll_timer.stop()
             return
-        self._poll_count += 1
         self._api.get(
             f"/api/projects/{self._current_project}/mvs/log?lines=60&mvs_type={self._current_mvs_type}",
             tag="mvs_poll_log",
         )
-        # 每 5 次（15s）检查一次结果
-        if self._poll_count % 5 == 0:
-            self._check_result()
+        # 每 tick 都查后端运行状态：进程退出即落定，据此判定完成
+        self._check_result()
 
     def _check_result(self):
         self._api.get(
@@ -560,17 +616,13 @@ class MvsPage(BasePage):
                 self._status_label.setText(f"加载项目失败: {error}")
                 return
             projects = payload.get("projects", [])
-            current = self.project_combo.currentText()
-            self.project_combo.blockSignals(True)
-            self.project_combo.clear()
-            for p in projects:
-                self.project_combo.addItem(p.get("project_name", ""))
-            if current:
-                idx = self.project_combo.findText(current)
-                if idx >= 0:
-                    self.project_combo.setCurrentIndex(idx)
-            self.project_combo.blockSignals(False)
+            previous = self.project_combo.currentText()
+            selected = fill_project_combo(self.project_combo, projects)
             self._log_msg(f"✓ 加载了 {len(projects)} 个项目")
+            # fill 期间屏蔽了信号：若全局选中项与下拉框现值不同，
+            # 需手动触发 _on_project_changed 以刷新结果面板。
+            if selected != previous:
+                self._on_project_changed(selected)
 
         # ── 启动响应 ──
         elif tag == "mvs_run":
@@ -582,11 +634,10 @@ class MvsPage(BasePage):
             else:
                 self._log_msg("✓ MVS 任务已启动，开始轮询日志...")
                 self._status_label.setText("MVS 运行中...")
-                self._poll_count = 0
                 self._poll_log()
                 self._poll_timer.start()
 
-        # ── 日志轮询 ──
+        # ── 日志轮询（仅展示；完成判定以后端 /mvs/result 的 run_status 为准）──
         elif tag == "mvs_poll_log":
             log_text = payload.get("log", "")
             if log_text and log_text != "(no log yet)":
@@ -595,41 +646,41 @@ class MvsPage(BasePage):
                 if scrollbar:
                     scrollbar.setValue(scrollbar.maximum())
 
-                # 检测本次运行的结束标记。
-                # - openmvs 写 "=== MVS END"，colmap 写 "=== PIPELINE END"，两者都要识别；
-                # - 只认“本轮 START 出现之后、且 END 之后再无新一轮 START”才算结束，
-                #   避免上一次运行残留的 footer 导致误判提前结束。
-                is_openmvs = self._current_mvs_type == "openmvs"
-                start_marker = (
-                    f"=== MVS START {self._current_project}"
-                    if is_openmvs
-                    else f"=== PIPELINE START {self._current_project}"
-                )
-                end_marker = "=== MVS END" if is_openmvs else "=== PIPELINE END"
-
-                if start_marker in log_text:
-                    self._current_run_started = True
-
-                last_end = log_text.rfind(end_marker)
-                if last_end >= 0 and self._current_run_started and not self._finished_seen:
-                    # END 之后不应再出现新一轮的 START（否则日志尾部是上一次运行的 footer）
-                    after_end = log_text[last_end + len(end_marker):]
-                    if start_marker not in after_end:
-                        self._finished_seen = True
-                        if "exit_code: 0" in log_text[last_end:]:
-                            self._log_msg("✓ MVS 进程正常退出")
-                        else:
-                            self._log_msg("✗ MVS 进程异常退出")
-                        self._set_running(False)
-                        self._status_label.setText("MVS 已结束")
-                        self._poll_timer.stop()
-                        self._check_result()
-
-        # ── 结果查询 ──
+        # ── 结果查询（含后端运行状态，据此判定完成）──
         elif tag == "mvs_result":
             if error:
                 self.result_label.setText(f"⚠ 查询结果失败: {error}")
                 return
+            run_status = payload.get("run_status")
+            exit_code = payload.get("exit_code")
+
+            # 运行中：以后端 run_status 判定完成，替代解析日志关键字
+            if self._running:
+                if run_status == "running":
+                    self._status_label.setText("MVS 运行中...")
+                    return
+                self._set_running(False)
+                self._poll_timer.stop()
+                if run_status == "ok":
+                    self._log_msg("✓ MVS 进程正常退出")
+                    self._status_label.setText("MVS 已结束")
+                elif run_status == "failed":
+                    self._log_msg(f"✗ MVS 进程异常退出 (exit_code: {exit_code})")
+                    self._status_label.setText("MVS 失败")
+                else:
+                    # idle：状态缺失（后端重启等）→ 保守停止，避免无限轮询
+                    self._log_msg("⚠ MVS 运行状态丢失，已停止轮询")
+                    self._status_label.setText("MVS 状态未知")
+                    return
+
+            # 失败优先展示失败信息（即使结果文件缺失或残留旧步骤）
+            if run_status == "failed":
+                msg = "❌ MVS 进程异常退出"
+                if exit_code is not None:
+                    msg += f" (exit_code: {exit_code})"
+                self.result_label.setText(msg)
+                return
+
             ready = payload.get("ready", False)
             if not ready:
                 msg = payload.get("message", "暂无 MVS 结果。")
@@ -709,6 +760,11 @@ class MvsPage(BasePage):
             self.run_btn.setText("⏳ 运行中...")
         else:
             self.run_btn.setText("▶ 运行 MVS")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 进入页面时重新拉取列表，让「别处选中的项目」也能同步到下拉框
+        self._load_projects()
 
     def _log_msg(self, text: str):
         ts = datetime.now().strftime("%H:%M:%S")

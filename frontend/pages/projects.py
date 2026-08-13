@@ -36,6 +36,7 @@ from PySide6.QtNetwork import (
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont
 
 from .base_page import BasePage
+from state import ProjectState
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -808,6 +809,9 @@ class ProjectsPage(BasePage):
         self._api = ApiClient.instance()
         self._api.finished.connect(self._on_api_response)
 
+        self._state = ProjectState.instance()
+        self._state.current_changed.connect(self._on_shared_project_changed)
+
         self._projects: dict[str, dict] = {}          # 缓存列表数据
         self._selected_project: str = ""               # 当前选中
         self._detail_loaded: set[str] = set()          # 已加载详情的项目
@@ -916,6 +920,7 @@ class ProjectsPage(BasePage):
                     if project_name:
                         self._selected_project = project_name
                         self._load_project_detail(project_name)
+                        self._state.set_current(project_name)
                     self._reset_create_btn()
 
         # ── 文件上传响应 ──
@@ -935,6 +940,7 @@ class ProjectsPage(BasePage):
             if project_name:
                 self._selected_project = project_name
                 self._load_project_detail(project_name)
+                self._state.set_current(project_name)
             self._reset_create_btn()
 
         # ── 删除项目响应 ──
@@ -945,6 +951,7 @@ class ProjectsPage(BasePage):
                 self._selected_project = ""
                 self._detail_panel.show_empty()
                 self._status_label.setText("✓ 项目已删除")
+                self._state.set_current("")
                 self._refresh_list()
 
         # ── 列表响应 ──
@@ -1061,6 +1068,29 @@ class ProjectsPage(BasePage):
                     w.setStyleSheet("")
         # 加载详情
         self._load_project_detail(project_name)
+        # 广播到全局，其余页面同步选中
+        self._state.set_current(project_name)
+
+    def _on_shared_project_changed(self, project: str):
+        """其余页面选中了项目 → 同步本页高亮与详情。"""
+        if project == self._selected_project:
+            return  # 本页自己触发的选择已在 _on_select_project 处理
+        self._selected_project = project
+        # 刷新卡片高亮
+        for i in range(self._cards_layout.count()):
+            w = self._cards_layout.itemAt(i).widget()
+            if isinstance(w, ProjectCard):
+                if w.project_name == project:
+                    w.setStyleSheet(
+                        "#projectCard { border-color:#58a6ff; background-color:#1c2533; }"
+                    )
+                else:
+                    w.setStyleSheet("")
+        if project:
+            if self.isVisible():
+                self._load_project_detail(project)
+        else:
+            self._detail_panel.show_empty()
 
     def _load_project_detail(self, project_name: str):
         self._detail_panel._header_label.setText("加载中...")

@@ -91,12 +91,49 @@ def build_sfm_command(
 _running_processes: dict[str, subprocess.Popen] = {}
 
 
+def _ensure_colmap_running() -> None:
+    """调用前确保 colmap-dev 容器在跑；未跑则 docker start（不常驻，随调用启动）。
+
+    SfM 与 colmap MVS 都经此 runner 执行 docker exec，调用时统一拉起容器。
+    同步执行：容器起不来直接抛错 → 上层 500。调用方应在标记 RUNNING 前调用，
+    以免留下悬空运行状态。
+    """
+    try:
+        inspect = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", CONTAINER_NAME],
+            capture_output=True, text=True, timeout=15,
+        )
+        if inspect.returncode == 0 and inspect.stdout.strip() == "true":
+            return  # already running
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        raise RuntimeError("Docker not available; cannot ensure colmap-dev container")
+
+    logger.info("%s container not running, starting before exec...", CONTAINER_NAME)
+    start = subprocess.run(
+        ["docker", "start", CONTAINER_NAME],
+        capture_output=True, text=True, timeout=30,
+    )
+    if start.returncode != 0:
+        raise RuntimeError(
+            f"Failed to start {CONTAINER_NAME} container: {start.stderr.strip()}\n"
+            f"Create it first: docker run -d --name {CONTAINER_NAME} --gpus all "
+            f"-v /home/zwz/Code/SFM/colmap:/colmap "
+            f"-v /home/zwz/Code/DATA:/data "
+            f"-v /home/zwz/Code/platform/shared_data:/shared_data "
+            f"platform/colmap:latest tail -f /dev/null"
+        )
+    logger.info("%s container started", CONTAINER_NAME)
+
+
 def run_pipeline_async(
     project_name: str,
     cmd: list[str],
     on_complete: callable | None = None,
 ) -> subprocess.Popen | None:
     """Run the pipeline command asynchronously in a background thread."""
+
+    # 调用即启动：确保 colmap-dev 容器在跑（不常驻），失败则同步抛错
+    _ensure_colmap_running()
 
     def _target():
         logger.info("Project %r: launching docker exec...", project_name)

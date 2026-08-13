@@ -54,8 +54,12 @@ def build_mvs_command(
     sfm_dir = DATA_DIR_CONTAINER / project_name / "SFM_output"
     output_dir = DATA_DIR_CONTAINER / project_name / "MVS_output" / "openmvs"
 
+    # openmvs 容器为 Ubuntu 18.04 + Python 3.6（ascii locale），非 ASCII 项目名
+    # 会被 surrogateescape 解成代理字符 → 加 UTF-8 locale 保证 argv 正确解码。
     cmd = [
-        "docker", "exec", CONTAINER_NAME,
+        "docker", "exec",
+        "-e", "LANG=C.UTF-8", "-e", "LC_ALL=C.UTF-8",
+        CONTAINER_NAME,
         "python3", MVS_CLI_PATH,
         command,
         "--project", project_name,
@@ -118,10 +122,72 @@ def build_mvs_command(
 
 
 # ---------------------------------------------------------------------------
+# Run-state tracking
+# ---------------------------------------------------------------------------
+
+# 最近一次 MVS 运行的结果状态，keyed by project_name。
+# 前端据此判定完成（替代解析日志关键字），进程退出即落定，幂等。
+_mvs_run_state: dict[str, dict] = {}
+
+
+def _finalize_mvs_state(project_name: str, exit_code: int) -> None:
+    """记录一次 MVS 运行的最终状态（进程退出时调用，幂等）。"""
+    _mvs_run_state[project_name] = {
+        "status": "ok" if exit_code == 0 else "failed",
+        "exit_code": exit_code,
+    }
+
+
+def get_mvs_run_status(project_name: str) -> dict | None:
+    """返回当前 MVS 运行状态；本会话从未运行过返回 None。
+
+    - {"status": "running"}                       进程存活
+    - {"status": "ok"|"failed", "exit_code": int} 已结束
+    """
+    proc = _running_mvs_processes.get(project_name)
+    if proc is not None and proc.poll() is None:
+        return {"status": "running"}
+    if proc is not None:
+        # 进程已退出而 _target 尚未落定状态（罕见竞态）→ 就地补齐
+        _finalize_mvs_state(project_name, proc.returncode)
+    return _mvs_run_state.get(project_name)
+
+
+# ---------------------------------------------------------------------------
 # Async runner
 # ---------------------------------------------------------------------------
 
 _running_mvs_processes: dict[str, subprocess.Popen] = {}
+
+
+def _ensure_openmvs_running() -> None:
+    """调用前确保 openmvs 容器在跑；未跑则 docker start（不常驻，随调用启动）。
+
+    放在 run_mvs_async 里、标记运行状态之前同步执行：容器起不来时
+    直接抛错 → POST 返回 500，不会留下一个永不结束的 running 状态。
+    """
+    try:
+        inspect = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", CONTAINER_NAME],
+            capture_output=True, text=True, timeout=15,
+        )
+        if inspect.returncode == 0 and inspect.stdout.strip() == "true":
+            return  # already running
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        raise RuntimeError("Docker not available; cannot ensure openmvs container")
+
+    logger.info("%s container not running, starting before exec...", CONTAINER_NAME)
+    start = subprocess.run(
+        ["docker", "start", CONTAINER_NAME],
+        capture_output=True, text=True, timeout=30,
+    )
+    if start.returncode != 0:
+        raise RuntimeError(
+            f"Failed to start {CONTAINER_NAME} container: {start.stderr.strip()}\n"
+            f"Create it first: docker run -d --name {CONTAINER_NAME} --gpus all "
+            f"-v {DATA_DIR_HOST}:/data openmvs/openmvs-ubuntu:latest tail -f /dev/null"
+        )
+    logger.info("%s container started", CONTAINER_NAME)
 
 
 def run_mvs_async(
@@ -130,6 +196,13 @@ def run_mvs_async(
     on_complete: callable | None = None,
 ) -> subprocess.Popen | None:
     """Run the MVS command asynchronously in a background thread."""
+
+    # 调用即启动：确保 openmvs 容器在跑（不常驻），失败则同步抛错
+    _ensure_openmvs_running()
+
+    # 同步标记运行中：保证 POST 返回时，前端立即查询到 run_status=running，
+    # 不会误判为 idle 而提前停表（docker exec 启动可能慢于 join(0.1)）。
+    _mvs_run_state[project_name] = {"status": "running", "exit_code": None}
 
     def _target():
         logger.info("Project %r: launching MVS docker exec...", project_name)
@@ -169,6 +242,8 @@ def run_mvs_async(
 
             proc.wait()
             logger.info("Project %r: MVS docker exited with code %d", project_name, proc.returncode)
+            # 落定运行状态（幂等；get_mvs_run_status 也会在观察到期时补齐）
+            _finalize_mvs_state(project_name, proc.returncode)
 
             footer = f"\n{'='*60}\n=== MVS END {project_name} | exit_code: {proc.returncode}\n{'='*60}\n"
             proj_f.write(footer)

@@ -39,6 +39,7 @@ from modules.models import (
 from modules.mvs_runner import (
     build_mvs_command,
     get_mvs_process,
+    get_mvs_run_status,
     is_mvs_running,
     remove_mvs_process,
     run_mvs_async,
@@ -156,14 +157,16 @@ def _start_pipeline(project_name: str) -> None:
 
     logger.info("Project %r starting pipeline: %s", project_name, " ".join(cmd))
 
+    # run_pipeline_async 内部会先确保 colmap-dev 容器在跑（调用即启动），
+    # 成功返回后才标记 RUNNING：容器起不来时不会留下悬空运行状态。
+    run_pipeline_async(project_name, cmd)
+
     update_project(
         project_name,
         status=TaskStatus.RUNNING.value,
         started_at=datetime.now(timezone.utc).isoformat(),
         error_message=None,
     )
-
-    run_pipeline_async(project_name, cmd)
 
 
 # ---------------------------------------------------------------------------
@@ -677,11 +680,11 @@ def _check_sam_completion(project_name: str) -> None:
         remove_sam_process(project_name)
 
 
-async def _ensure_sam3_container() -> None:
-    """Make sure the sam3 container is running; start it if stopped."""
+async def _ensure_container(container_name: str, create_hint: str) -> None:
+    """Make sure a docker container is running; start it if stopped."""
     try:
         proc = await asyncio.create_subprocess_exec(
-            "docker", "inspect", "-f", "{{.State.Running}}", "sam3",
+            "docker", "inspect", "-f", "{{.State.Running}}", container_name,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -692,56 +695,67 @@ async def _ensure_sam3_container() -> None:
         raise HTTPException(500, "Docker not available")
 
     # Container exists but not running, or doesn't exist — start it
-    logger.info("sam3 container not running, starting...")
+    logger.info("%s container not running, starting...", container_name)
     try:
         # Try docker start first (container exists but stopped)
         proc = await asyncio.create_subprocess_exec(
-            "docker", "start", "sam3",
+            "docker", "start", container_name,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         await proc.communicate()
         if proc.returncode != 0:
-            raise RuntimeError("docker start sam3 failed")
+            raise RuntimeError(f"docker start {container_name} failed")
     except Exception:
         raise HTTPException(
             500,
-            "sam3 container is not available. Please create it first:\n"
-            "  docker run -d --name sam3 --gpus all -v /path/to/data:/data sam3-image",
+            f"{container_name} container is not available. Please create it first:\n"
+            f"  {create_hint}",
         )
 
     # Wait for container to be ready
     for _ in range(30):
         await asyncio.sleep(1)
         proc = await asyncio.create_subprocess_exec(
-            "docker", "inspect", "-f", "{{.State.Running}}", "sam3",
+            "docker", "inspect", "-f", "{{.State.Running}}", container_name,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await proc.communicate()
         if proc.returncode == 0 and stdout.decode().strip() == "true":
-            logger.info("sam3 container is now running")
+            logger.info("%s container is now running", container_name)
             return
-    raise HTTPException(500, "sam3 container started but not ready after 30s")
+    raise HTTPException(500, f"{container_name} container started but not ready after 30s")
+
+
+async def _ensure_sam3_container() -> None:
+    await _ensure_container(
+        "sam3",
+        "docker run -d --name sam3 --gpus all -v /path/to/data:/data sam3-image",
+    )
+
+
+# SAM scripts live in the SAM repo dir, mounted at /workspace inside sam3.
+SAM_SCRIPTS_DIR = Path("/home/zwz/Code/SAM")
 
 
 async def _setup_sam_script() -> None:
-    """Copy SAM_box.py and SAM_point.py into DATA_DIR if not already present."""
+    """Sync SAM_box.py / SAM_point.py / sam_worker.py into the SAM dir (mounted at /workspace)."""
     algo_dir = Path(__file__).parent / "algorithm"
 
     box_src = algo_dir / "SAM_box.py"
-    box_dst = DATA_DIR / "sam_box.py"
+    box_dst = SAM_SCRIPTS_DIR / "sam_box.py"
     if box_src.exists() and not box_dst.exists():
         shutil.copy(box_src, box_dst)
 
     point_src = algo_dir / "SAM_point.py"
-    point_dst = DATA_DIR / "sam_point.py"
+    point_dst = SAM_SCRIPTS_DIR / "sam_point.py"
     if point_src.exists() and not point_dst.exists():
         shutil.copy(point_src, point_dst)
 
-    # Also sync SAM_CLI.py (serve-mode worker) to DATA_DIR — always copy latest
-    cli_src = Path("/home/zwz/Code/SAM/SAM_CLI.py")
-    cli_dst = DATA_DIR / "sam_worker.py"
+    # Also sync SAM_CLI.py (serve-mode worker) — always copy latest
+    cli_src = SAM_SCRIPTS_DIR / "SAM_CLI.py"
+    cli_dst = SAM_SCRIPTS_DIR / "sam_worker.py"
     if cli_src.exists():
         shutil.copy(cli_src, cli_dst)
 
@@ -757,7 +771,7 @@ _worker_lock = asyncio.Lock()
 async def _ensure_sam3_worker() -> None:
     """Ensure the persistent SAM worker is running (model stays in GPU).
 
-    Spawns `docker exec -i sam3 python3 /data/sam_worker.py --serve`
+    Spawns `docker exec -i sam3 python3 /workspace/sam_worker.py --serve`
     and waits for the ready signal.  Uses _worker_lock to serialize
     all communication with the single worker process.
     """
@@ -786,7 +800,7 @@ async def _ensure_sam3_worker() -> None:
     logger.info("Starting persistent SAM worker...")
     proc = await asyncio.create_subprocess_exec(
         "docker", "exec", "-i", "sam3",
-        "python3", "/data/sam_worker.py",
+        "python3", "/workspace/sam_worker.py",
         "--serve",
         "--checkpoint", "/workspace/model/sam3.pt",
         "--device", "cuda",
@@ -1329,8 +1343,9 @@ async def run_mvs_pipeline(
             mvs_type="colmap",
         )
         logger.info("Project %r: starting COLMAP MVS", project_name)
-        update_project(project_name, status=TaskStatus.RUNNING.value)
+        # run_colmap_async 内部先确保 colmap-dev 容器在跑，成功后标记 RUNNING
         await asyncio.to_thread(run_colmap_async, project_name, cmd)
+        update_project(project_name, status=TaskStatus.RUNNING.value)
         return {
             "success": True,
             "message": f"COLMAP MVS started for {project_name}",
@@ -1421,6 +1436,22 @@ async def get_mvs_log(project_name: str, lines: int = 100,
         return {"project_name": project_name, "log": "(error reading log)"}
 
 
+def _clean_surrogates(obj: object) -> object:
+    """把 surrogateescape 产生的代理字符还原为正常 UTF-8。
+
+    历史数据防御：openmvs 容器（Python 3.6 + ascii locale）曾把非 ASCII 项目名
+    解码成 \\udc 开头的代理字符并写入结果 JSON，响应渲染时会导致
+    UnicodeEncodeError: surrogates not allowed。这里还原成可编码的 UTF-8。
+    """
+    if isinstance(obj, str):
+        return obj.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
+    if isinstance(obj, list):
+        return [_clean_surrogates(v) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _clean_surrogates(v) for k, v in obj.items()}
+    return obj
+
+
 @app.get("/api/projects/{project_name}/mvs/result")
 async def get_mvs_result(project_name: str, mvs_type: str = "openmvs"):
     """Get MVS pipeline result (mvs_pipeline_result.json).
@@ -1431,6 +1462,22 @@ async def get_mvs_result(project_name: str, mvs_type: str = "openmvs"):
             - colmap:  SFM_output/pipeline_result.json
     """
     _check_mvs_completion(project_name)
+
+    # 后端权威的 MVS 运行状态 — 前端据此判定完成（替代解析日志关键字）。
+    if mvs_type == "colmap":
+        # colmap 走 SfM 的 task.json 状态机
+        _check_process_completion(project_name)
+        task_status = (get_project(project_name) or {}).get("status", "pending")
+        run_status = {
+            "running": "running",
+            "completed": "ok",
+            "failed": "failed",
+        }.get(task_status, "idle")
+        exit_code = None
+    else:
+        st = get_mvs_run_status(project_name)
+        run_status = st.get("status", "idle") if st else "idle"
+        exit_code = (st or {}).get("exit_code")
 
     p = get_project(project_name)
     if p is None:
@@ -1451,13 +1498,23 @@ async def get_mvs_result(project_name: str, mvs_type: str = "openmvs"):
             "project_name": project_name,
             "ready": False,
             "message": "No MVS results yet. Run MVS pipeline first.",
+            "run_status": run_status,
+            "exit_code": exit_code,
         }
 
     try:
         with open(result_path, encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError):
-        return {"project_name": project_name, "ready": False, "message": "Failed to parse MVS results."}
+        return {
+            "project_name": project_name,
+            "ready": False,
+            "message": "Failed to parse MVS results.",
+            "run_status": run_status,
+            "exit_code": exit_code,
+        }
+    # 历史数据防御：容器 ascii locale 曾写入代理字符，还原后渲染不再 500
+    data = _clean_surrogates(data)
 
     if mvs_type == "colmap":
         # colmap 的 pipeline_result.json 结构与 openmvs 不同，做一次映射
@@ -1471,6 +1528,8 @@ async def get_mvs_result(project_name: str, mvs_type: str = "openmvs"):
             "status": "ok" if steps else "pending",
             "steps": steps,
             "total_elapsed": pipeline.get("elapsed_seconds"),
+            "run_status": run_status,
+            "exit_code": exit_code,
         }
 
     return {
@@ -1480,6 +1539,8 @@ async def get_mvs_result(project_name: str, mvs_type: str = "openmvs"):
         "project": data.get("project"),
         "steps": data.get("steps", {}),
         "total_elapsed": data.get("total_elapsed"),
+        "run_status": run_status,
+        "exit_code": exit_code,
     }
 
 

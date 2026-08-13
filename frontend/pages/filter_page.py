@@ -29,6 +29,7 @@ from PySide6.QtGui import QFont
 
 from .base_page import BasePage
 from .projects import ApiClient
+from state import ProjectState, fill_project_combo
 
 API_BASE = "http://localhost:8000"
 
@@ -54,6 +55,8 @@ class FilterPage(BasePage):
 
         self._api = ApiClient.instance()
         self._api.finished.connect(self._on_response)
+        self._state = ProjectState.instance()
+        self._state.current_changed.connect(self._on_shared_project_changed)
 
         # 独立下载管理器（用于下载二进制 PLY，避免干扰 JSON 解析）
         self._dl_mgr = QNetworkAccessManager(self)
@@ -163,9 +166,6 @@ class FilterPage(BasePage):
         self._log.setFont(QFont("Consolas", 9))
         self.content_layout.addWidget(self._log)
 
-        # ── 启动 ──
-        self._load_projects()
-
     # ------------------------------------------------------------------
     # 项目列表
     # ------------------------------------------------------------------
@@ -176,6 +176,7 @@ class FilterPage(BasePage):
 
     def _on_project_changed(self, project: str):
         """切换项目时检查是否已有过滤结果。"""
+        self._state.set_current(project)
         self._current_project = project
         self.download_btn.setEnabled(False)
         if project:
@@ -183,6 +184,23 @@ class FilterPage(BasePage):
                 f"/api/projects/{project}/filter/result",
                 tag="filter_check_result",
             )
+
+    def _on_shared_project_changed(self, project: str):
+        """其余页面选中了项目 → 同步本页下拉框。
+
+        运行中不跟随：过滤在后台跑时，_current_project 决定下载目标，
+        不能被切页选择改掉。
+        """
+        if self._running:
+            return
+        if self.project_combo.currentText() == project:
+            return
+        if project:
+            idx = self.project_combo.findText(project)
+            if idx >= 0:
+                self.project_combo.setCurrentIndex(idx)
+        else:
+            self.project_combo.setCurrentIndex(-1)
 
     # ------------------------------------------------------------------
     # 运行过滤
@@ -258,17 +276,13 @@ class FilterPage(BasePage):
                 self._status_label.setText(f"加载项目失败: {error}")
                 return
             projects = payload.get("projects", [])
-            current = self.project_combo.currentText()
-            self.project_combo.blockSignals(True)
-            self.project_combo.clear()
-            for p in projects:
-                self.project_combo.addItem(p.get("project_name", ""))
-            if current:
-                idx = self.project_combo.findText(current)
-                if idx >= 0:
-                    self.project_combo.setCurrentIndex(idx)
-            self.project_combo.blockSignals(False)
+            previous = self.project_combo.currentText()
+            selected = fill_project_combo(self.project_combo, projects)
             self._log_msg(f"✓ 加载了 {len(projects)} 个项目")
+            # fill 期间屏蔽了信号：若全局选中项与下拉框现值不同，
+            # 需手动触发 _on_project_changed 以检查结果。
+            if selected != previous:
+                self._on_project_changed(selected)
 
         # ── 检查已有过滤结果 ──
         elif tag == "filter_check_result":
@@ -361,6 +375,11 @@ class FilterPage(BasePage):
             self.run_btn.setText("⏳ 过滤中...")
         else:
             self.run_btn.setText("▶ 运行点云过滤")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 进入页面时重新拉取列表，让「别处选中的项目」也能同步到下拉框
+        self._load_projects()
 
     def _log_msg(self, text: str):
         ts = datetime.now().strftime("%H:%M:%S")
