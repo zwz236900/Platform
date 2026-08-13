@@ -40,6 +40,7 @@ def build_sfm_command(
     vocab_tree_path: str | None = None,
     convert_output_suffix: str = "txt",
     mvs_type: str = "colmap",
+    reuse_dense_dir: str | None = None,
 ) -> list[str]:
     """Build the docker exec command to run sfm_cli.py inside the container.
 
@@ -54,7 +55,7 @@ def build_sfm_command(
     steps_str = ",".join(steps) if steps else "extract,match,sfm,undistort,mvs"
 
     cmd = [
-        "docker", "exec", CONTAINER_NAME,
+        "docker", "exec", "-e", "PYTHONUNBUFFERED=1", CONTAINER_NAME,
         "python3", SFM_CLI_PATH,
         "--image_dir", str(image_dir),
         "--output_dir", str(output_dir),
@@ -73,6 +74,11 @@ def build_sfm_command(
     if steps and any(s in ("mvs", "fusion") for s in steps):
         dense_dir = DATA_DIR_CONTAINER / project_name / "MVS_output" / mvs_type
         cmd += ["--dense_dir", str(dense_dir)]
+
+    # reuse step: reuse the SfM undistort output (SFM_output/dense) so COLMAP MVS
+    # skips a redundant image_undistorter pass and runs only patch_match + fusion.
+    if reuse_dense_dir:
+        cmd += ["--reuse_dense_dir", str(reuse_dense_dir)]
 
     if convert_output_suffix:
         cmd += ["--convert_output_suffix", convert_output_suffix]

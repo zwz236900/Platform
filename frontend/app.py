@@ -13,12 +13,14 @@ from pages.mvs import MvsPage
 from pages.sam import SAMPage
 from pages.filter_page import FilterPage
 from pages.mask import MaskPage
+from pages.gs import GsPage
 
 PAGES = [
     ("projects",     "项目管理",     ProjectsPage),
     ("preprocess",   "预处理",       PreprocessPage),
     ("sfm",          "SfM 重建",     SfMPage),
     ("mvs",          "MVS 重建",     MvsPage),
+    ("gs",           "3DGS 重建",    GsPage),
     ("sam",          "SAM 分割",     SAMPage),
     ("filter",       "点云过滤",     FilterPage),
     ("mask",         "图像掩码",     MaskPage),

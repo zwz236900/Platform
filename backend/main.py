@@ -1333,14 +1333,22 @@ async def run_mvs_pipeline(
             raise HTTPException(400, "COLMAP pipeline is already running")
 
         from modules.docker_runner import build_sfm_command, run_pipeline_async as run_colmap_async
-        # Run undistort + mvs: undistort sets up workspace at dense_dir,
-        # then mvs (patch_match_stereo + fusion) runs on it.
+
+        # SfM 的去畸变步骤已产出 SFM_output/dense/{images,sparse,stereo}（PINHOLE 模型
+        # + 去畸变图像）。存在时 COLMAP MVS 复用该工作区（reuse 步骤只复制，跳过重复
+        # image_undistorter），再跑 patch_match + fusion；不存在时回退 undistort + mvs。
+        sfm_dense = _sfm_output_dir(project_name) / "dense"
+        can_reuse = (sfm_dense / "images").is_dir() and (sfm_dense / "sparse").is_dir()
+        steps = ["reuse", "mvs"] if can_reuse else ["undistort", "mvs"]
+        reuse_dense_dir = f"/data/{project_name}/SFM_output/dense" if can_reuse else None
+
         cmd = build_sfm_command(
             project_name,
-            steps=["undistort", "mvs"],
+            steps=steps,
             use_gpu=not no_cuda,
             gpu_index=0,
             mvs_type="colmap",
+            reuse_dense_dir=reuse_dense_dir,
         )
         logger.info("Project %r: starting COLMAP MVS", project_name)
         # run_colmap_async 内部先确保 colmap-dev 容器在跑，成功后标记 RUNNING
@@ -1627,11 +1635,18 @@ async def run_3dgs_pipeline(
     if command not in GS_COMMANDS:
         raise HTTPException(400, f"Invalid 3DGS command: {command}. Choices: {GS_COMMANDS}")
 
-    # Verify prerequisites for train/render
+    # Verify prerequisites for train/render.
+    # 3DGS 需要去畸变图像 + PINHOLE 模型：来自 SfM undistort 的输出
+    # (SFM_output/dense/{images,sparse})。未跑 undistort 时 dense 目录不存在。
     if command in ("train", "full"):
-        sfm_sparse = _sfm_output_dir(project_name) / "sparse" / "0"
-        if not sfm_sparse.exists():
-            raise HTTPException(400, "SfM output not found. Run SfM pipeline first.")
+        dense_sparse = _sfm_output_dir(project_name) / "dense" / "sparse"
+        dense_images = _sfm_output_dir(project_name) / "dense" / "images"
+        if not dense_sparse.exists() or not dense_images.exists():
+            raise HTTPException(
+                400,
+                "未找到去畸变输出（SFM_output/dense）。3DGS 需要 SfM 的 undistort "
+                "步骤输出（去畸变图像 + PINHOLE 模型），请先运行 SfM 管线（含去畸变）。",
+            )
 
     cmd = build_gs_command(
         project_name,
@@ -1698,27 +1713,44 @@ async def get_gs_result(project_name: str):
         }
 
     # Find the latest iteration directory
+    # renders 返回相对 3DGS_output 的路径（如 train/ours_30000/renders/xxx.png），
+    # 前端可直接拼 /3dgs/download/<path> 预览 / 下载。
     train_renders_dir = output_dir / "train"
     renders = []
+    iteration_name = ""
     if train_renders_dir.exists():
         for ours_dir in sorted(train_renders_dir.iterdir(), reverse=True):
             if ours_dir.is_dir() and ours_dir.name.startswith("ours_"):
                 render_subdir = ours_dir / "renders"
                 if render_subdir.exists():
+                    iteration_name = ours_dir.name
+                    rel_prefix = f"train/{ours_dir.name}/renders"
                     renders = sorted([
-                        p.name for p in render_subdir.iterdir()
+                        f"{rel_prefix}/{p.name}"
+                        for p in render_subdir.iterdir()
                         if p.suffix.lower() == ".png"
                     ])
                 break
 
     has_point_cloud = (output_dir / "point_cloud").exists()
+    # 点云 PLY 相对路径（若有），前端可下载
+    point_cloud_ply = ""
+    pc_root = output_dir / "point_cloud"
+    if pc_root.exists():
+        for d in sorted(pc_root.iterdir(), reverse=True):
+            ply = d / "point_cloud.ply"
+            if ply.exists():
+                point_cloud_ply = str(ply.relative_to(output_dir))
+                break
 
     return {
         "project_name": project_name,
         "ready": True,
         "renders_count": len(renders),
         "renders": renders,
+        "iteration_name": iteration_name,
         "has_point_cloud": has_point_cloud,
+        "point_cloud_ply": point_cloud_ply,
     }
 
 

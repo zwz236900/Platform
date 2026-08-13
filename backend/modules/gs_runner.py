@@ -43,23 +43,30 @@ def build_gs_command(
     """Build the docker exec command to run gs_cli.py inside the gs3 container.
 
     Project layout inside container:
-        /data/<project>/Input/input_image/   →  --image-dir
-        /data/<project>/SFM_output/sparse/0/ →  --sfm-dir
-        /data/<project>/3DGS_input/          →  --source
-        /data/<project>/3DGS_output/         →  -m / --model
+        /data/<project>/SFM_output/dense/images/  →  --image-dir (去畸变后的图像)
+        /data/<project>/SFM_output/dense/sparse/  →  --sfm-dir (去畸变后的 COLMAP 模型)
+        /data/<project>/3DGS_input/               →  --source
+        /data/<project>/3DGS_output/              →  -m / --model
+
+    3DGS 需要 PINHOLE 相机 + 去畸变图像，因此使用 SfM undistort 阶段的输出
+    （dense/images + dense/sparse），而非原始输入图（Input/input_image）与
+    原始稀疏模型（SFM_output/sparse/0）。
     """
     source_dir = DATA_DIR_CONTAINER / project_name / "3DGS_input"
     model_dir = DATA_DIR_CONTAINER / project_name / "3DGS_output"
-    image_dir = DATA_DIR_CONTAINER / project_name / "Input" / "input_image"
-    sfm_dir = DATA_DIR_CONTAINER / project_name / "SFM_output" / "sparse" / "0"
+    image_dir = DATA_DIR_CONTAINER / project_name / "SFM_output" / "dense" / "images"
+    sfm_dir = DATA_DIR_CONTAINER / project_name / "SFM_output" / "dense" / "sparse"
 
     cmd = [
         "docker", "exec", "-e", "PYTHONUNBUFFERED=1", CONTAINER_NAME,
         "python3", GS_CLI_PATH,
         command,
         "--source", str(source_dir),
-        "--model", str(model_dir),
     ]
+
+    # --model 只在 train/render/full 子命令中存在（prepare 无此参数）
+    if command in ("train", "render", "full"):
+        cmd += ["--model", str(model_dir)]
 
     if command in ("prepare", "full"):
         cmd += [
@@ -99,12 +106,47 @@ def build_gs_command(
 _running_gs_processes: dict[str, subprocess.Popen] = {}
 
 
+def _ensure_gs_running() -> None:
+    """调用前确保 gs3 容器在跑；未跑则 docker start（不常驻，随调用启动）。
+
+    与 openmvs / colmap-dev 的 runner 保持一致：容器按需拉起，失败同步抛错
+    → 上层 500，不留悬空运行状态。
+    """
+    try:
+        inspect = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", CONTAINER_NAME],
+            capture_output=True, text=True, timeout=15,
+        )
+        if inspect.returncode == 0 and inspect.stdout.strip() == "true":
+            return  # already running
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        raise RuntimeError("Docker not available; cannot ensure gs3 container")
+
+    logger.info("%s container not running, starting before exec...", CONTAINER_NAME)
+    start = subprocess.run(
+        ["docker", "start", CONTAINER_NAME],
+        capture_output=True, text=True, timeout=30,
+    )
+    if start.returncode != 0:
+        raise RuntimeError(
+            f"Failed to start {CONTAINER_NAME} container: {start.stderr.strip()}\n"
+            f"Create it first: docker run -d --name {CONTAINER_NAME} --gpus all "
+            f"-v /home/zwz/Code/DATA:/data "
+            f"-v /home/zwz/Code/3DGS:/workspace/3DGS "
+            f"platform/gs:latest tail -f /dev/null"
+        )
+    logger.info("%s container started", CONTAINER_NAME)
+
+
 def run_gs_async(
     project_name: str,
     cmd: list[str],
     on_complete: callable | None = None,
 ) -> subprocess.Popen | None:
     """Run the 3DGS command asynchronously in a background thread."""
+
+    # 调用即启动：确保 gs3 容器在跑（不常驻），失败则同步抛错
+    _ensure_gs_running()
 
     def _target():
         logger.info("Project %r: launching 3DGS docker exec...", project_name)

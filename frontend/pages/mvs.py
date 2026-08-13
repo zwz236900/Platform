@@ -56,9 +56,9 @@ MVS_COMMANDS = [
     ("check",       "检查 check"),
 ]
 
-# COLMAP 引擎不支持单步（后端恒跑 undistort + mvs，command 参数被忽略）→ 只保留完整流程
+# COLMAP 引擎不支持单步（后端恒跑 mvs，复用 SfM 去畸变输出；无去畸变时自动补 undistort）
 MVS_COMMANDS_COLMAP = [
-    ("pipeline", "完整流程（去畸变 + 稠密重建）"),
+    ("pipeline", "完整流程（稠密重建）"),
 ]
 
 # 各命令可用的参数（其余置灰）
@@ -200,7 +200,7 @@ class MvsPage(BasePage):
         engine_form.addRow("运行命令:", self.command_combo)
 
         self._engine_hint = QLabel(
-            "OpenMVS: 基于 SfM 结果运行稠密重建流程；COLMAP: 去畸变 + patch_match 稠密重建。"
+            "OpenMVS: 基于 SfM 结果运行稠密重建流程；COLMAP: 复用 SfM 去畸变输出 + patch_match 稠密重建。"
         )
         self._engine_hint.setStyleSheet("color:#8b949e; font-size:12px;")
         self._engine_hint.setWordWrap(True)
@@ -445,7 +445,7 @@ class MvsPage(BasePage):
         self._repopulate_commands()
         if self._current_mvs_type == "openmvs":
             self._engine_hint.setText(
-                "OpenMVS: 基于 SfM 结果运行稠密重建流程；COLMAP: 去畸变 + patch_match 稠密重建。"
+                "OpenMVS: 基于 SfM 结果运行稠密重建流程；COLMAP: 复用 SfM 去畸变输出 + patch_match 稠密重建。"
             )
             # openmvs 容器内为 2019 年 CPU-only 构建，GPU 开关无意义 → 默认 CPU 模式
             self.no_cuda_check.setText("CPU 模式（当前构建无 GPU 加速）")
@@ -456,7 +456,8 @@ class MvsPage(BasePage):
             self.no_cuda_check.setChecked(True)
         else:
             self._engine_hint.setText(
-                "COLMAP MVS: 执行去畸变(undistort)与稠密重建(mvs)，输出到 MVS_output/colmap。"
+                "COLMAP MVS: 复用 SfM 去畸变输出（SFM_output/dense），只跑稠密重建；"
+                "若无去畸变输出则自动补 undistort。结果输出到 MVS_output/colmap。"
             )
             # colmap 4.2 带 CUDA → 默认启用 GPU
             self.no_cuda_check.setText("禁用 GPU（CPU 模式）")

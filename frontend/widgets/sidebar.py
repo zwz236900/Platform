@@ -31,6 +31,7 @@ class Sidebar(QWidget):
         "projects":    "📁",
         "preprocess":  "🖼",
         "sfm":         "🔍",
+        "gs":          "✨",
         "sam":         "✂",
         "filter":      "🧹",
         "mask":        "🖌",
