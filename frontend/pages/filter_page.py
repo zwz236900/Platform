@@ -1,29 +1,84 @@
-"""点云过滤页面（方案 A）."""
+"""点云过滤页面 — 通过 SAM 掩码多视角一致性过滤稠密点云.
+
+功能：参数配置 → 运行过滤 → 展示结果统计 → 下载过滤后的 PLY 点云。
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
 
 from PySide6.QtWidgets import (
-    QLabel, QPushButton, QHBoxLayout, QComboBox, QDoubleSpinBox,
-    QLineEdit, QGroupBox, QFormLayout,
+    QLabel,
+    QPushButton,
+    QHBoxLayout,
+    QComboBox,
+    QDoubleSpinBox,
+    QLineEdit,
+    QGroupBox,
+    QFormLayout,
+    QTextEdit,
+    QMessageBox,
+    QFileDialog,
+    QProgressBar,
+    QSizePolicy,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
+from PySide6.QtGui import QFont
 
 from .base_page import BasePage
+from .projects import ApiClient
+
+API_BASE = "http://localhost:8000"
+
+FILTERED_FILENAME = "filtered_scene.ply"
+
+
+def _format_size(n: int) -> str:
+    """人类可读的文件大小。"""
+    if n >= 1 << 30:
+        return f"{n / (1 << 30):.2f} GB"
+    if n >= 1 << 20:
+        return f"{n / (1 << 20):.2f} MB"
+    if n >= 1 << 10:
+        return f"{n / (1 << 10):.1f} KB"
+    return f"{n} B"
 
 
 class FilterPage(BasePage):
-    def __init__(self):
-        super().__init__("点云过滤（方案 A）")
+    """点云过滤 — 参数配置、运行与下载。"""
 
-        # 项目选择
+    def __init__(self):
+        super().__init__("点云过滤")
+
+        self._api = ApiClient.instance()
+        self._api.finished.connect(self._on_response)
+
+        # 独立下载管理器（用于下载二进制 PLY，避免干扰 JSON 解析）
+        self._dl_mgr = QNetworkAccessManager(self)
+        self._dl_mgr.finished.connect(self._on_download_finished)
+
+        self._running = False
+        self._current_project = ""
+
+        # ── 项目选择 ──
         row = QHBoxLayout()
         row.addWidget(QLabel("目标项目:"))
         self.project_combo = QComboBox()
-        self.project_combo.setEditable(True)
-        self.project_combo.setMinimumWidth(200)
+        self.project_combo.setMinimumWidth(220)
+        self.project_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.project_combo.currentTextChanged.connect(self._on_project_changed)
         row.addWidget(self.project_combo)
+
+        self._refresh_btn = QPushButton("🔄 刷新")
+        self._refresh_btn.setObjectName("actionBtn")
+        self._refresh_btn.clicked.connect(self._load_projects)
+        row.addWidget(self._refresh_btn)
         row.addStretch()
         self.content_layout.addLayout(row)
 
-        # 参数
+        # ── 参数 ──
         group = QGroupBox("过滤参数")
         form = QFormLayout(group)
 
@@ -40,18 +95,273 @@ class FilterPage(BasePage):
 
         self.content_layout.addWidget(group)
 
-        # 操作按钮
-        row2 = QHBoxLayout()
+        # ── 说明 ──
+        hint = QLabel(
+            "将每个三维点投影到所有相机视图，统计其落入 SAM 掩码内的比例，"
+            "比例 ≥ 阈值的点被保留。\n"
+            "需要：MVS 稠密点云 + COLMAP 稀疏模型 + SAM 掩码（algorithm_output/filtered_scene.ply）。"
+        )
+        hint.setStyleSheet("color:#8b949e; font-size:12px;")
+        hint.setWordWrap(True)
+        self.content_layout.addWidget(hint)
+
+        # ── 操作按钮 ──
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        self._status_label = QLabel("就绪，请选择项目")
+        self._status_label.setStyleSheet("color:#8b949e; font-size:13px;")
+        btn_row.addWidget(self._status_label)
+
+        btn_row.addStretch()
+
         self.run_btn = QPushButton("▶ 运行点云过滤")
         self.run_btn.setObjectName("primaryBtn")
-        row2.addStretch()
-        row2.addWidget(self.run_btn)
-        self.content_layout.addLayout(row2)
+        self.run_btn.setMinimumWidth(140)
+        self.run_btn.clicked.connect(self._on_run)
+        btn_row.addWidget(self.run_btn)
 
-        # 结果
+        self.download_btn = QPushButton("⬇ 下载过滤后点云")
+        self.download_btn.setObjectName("actionBtn")
+        self.download_btn.setMinimumWidth(150)
+        self.download_btn.setToolTip("下载过滤结果 filtered_scene.ply 到本地")
+        self.download_btn.clicked.connect(self._on_download)
+        self.download_btn.setEnabled(False)
+        btn_row.addWidget(self.download_btn)
+
+        self.content_layout.addLayout(btn_row)
+
+        # ── 进度条 ──
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)  # indeterminate
+        self.progress.setVisible(False)
+        self.content_layout.addWidget(self.progress)
+
+        # ── 结果统计 ──
         self.result_label = QLabel("等待运行...")
         self.result_label.setObjectName("logArea")
-        self.result_label.setMinimumHeight(200)
+        self.result_label.setMinimumHeight(100)
         self.result_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.result_label.setWordWrap(True)
         self.content_layout.addWidget(self.result_label, 1)
+
+        # ── 日志 ──
+        log_header = QHBoxLayout()
+        log_header.addWidget(QLabel("运行日志"))
+        log_header.addStretch()
+        clear_btn = QPushButton("清空")
+        clear_btn.setObjectName("actionBtn")
+        clear_btn.setFixedSize(50, 24)
+        clear_btn.clicked.connect(lambda: self._log.clear())
+        log_header.addWidget(clear_btn)
+        self.content_layout.addLayout(log_header)
+
+        self._log = QTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setObjectName("logArea")
+        self._log.setMaximumHeight(140)
+        self._log.setFont(QFont("Consolas", 9))
+        self.content_layout.addWidget(self._log)
+
+        # ── 启动 ──
+        self._load_projects()
+
+    # ------------------------------------------------------------------
+    # 项目列表
+    # ------------------------------------------------------------------
+
+    def _load_projects(self):
+        self._refresh_btn.setEnabled(False)
+        self._api.get("/api/projects", tag="filter_list_projects")
+
+    def _on_project_changed(self, project: str):
+        """切换项目时检查是否已有过滤结果。"""
+        self._current_project = project
+        self.download_btn.setEnabled(False)
+        if project:
+            self._api.get(
+                f"/api/projects/{project}/filter/result",
+                tag="filter_check_result",
+            )
+
+    # ------------------------------------------------------------------
+    # 运行过滤
+    # ------------------------------------------------------------------
+
+    def _on_run(self):
+        project = self.project_combo.currentText().strip()
+        if not project:
+            QMessageBox.warning(self, "提示", "请先选择一个项目。")
+            return
+
+        prompt = self.prompt_edit.text().strip()
+        if not prompt:
+            QMessageBox.warning(self, "提示", "请填写 Prompt Slug。")
+            return
+
+        self._current_project = project
+        self._set_running(True)
+        self._status_label.setText("过滤运行中...")
+        self.result_label.setText("⏳ 正在过滤，请稍候（密集点云可能需要几分钟）...")
+        self._log_msg(f"▶ 开始点云过滤 — 项目: {project}")
+        self._log_msg(f"  阈值: {self.threshold_spin.value():.2f}, prompt: {prompt}")
+
+        self._api.post(
+            f"/api/projects/{project}/preprocess/filter-pointcloud",
+            {
+                "threshold": str(self.threshold_spin.value()),
+                "prompt_slug": prompt,
+            },
+            tag="filter_run",
+        )
+
+    # ------------------------------------------------------------------
+    # 下载
+    # ------------------------------------------------------------------
+
+    def _on_download(self):
+        if not self._current_project:
+            return
+        default_name = f"{self._current_project}_{FILTERED_FILENAME}"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存过滤后的点云",
+            default_name,
+            "PLY 点云 (*.ply);;所有文件 (*)",
+        )
+        if not path:
+            return
+        self.download_btn.setEnabled(False)
+        self.download_btn.setText("⏳ 下载中...")
+        self._log_msg(f"⬇ 正在下载过滤后点云 → {path}")
+
+        url = QUrl(f"{API_BASE}/api/projects/{self._current_project}/filter/download/{FILTERED_FILENAME}")
+        req = QNetworkRequest(url)
+        reply = self._dl_mgr.get(req)
+        reply.setProperty("_save_path", path)
+        reply.setProperty("_project", self._current_project)
+
+    # ------------------------------------------------------------------
+    # 网络响应
+    # ------------------------------------------------------------------
+
+    def _on_response(self, method: str, path: str, payload: object):
+        if not isinstance(payload, dict):
+            return
+        tag = payload.get("_tag", "")
+        error = payload.get("_error", "")
+
+        # ── 项目列表 ──
+        if tag == "filter_list_projects":
+            self._refresh_btn.setEnabled(True)
+            if error:
+                self._status_label.setText(f"加载项目失败: {error}")
+                return
+            projects = payload.get("projects", [])
+            current = self.project_combo.currentText()
+            self.project_combo.blockSignals(True)
+            self.project_combo.clear()
+            for p in projects:
+                self.project_combo.addItem(p.get("project_name", ""))
+            if current:
+                idx = self.project_combo.findText(current)
+                if idx >= 0:
+                    self.project_combo.setCurrentIndex(idx)
+            self.project_combo.blockSignals(False)
+            self._log_msg(f"✓ 加载了 {len(projects)} 个项目")
+
+        # ── 检查已有过滤结果 ──
+        elif tag == "filter_check_result":
+            if error:
+                self._status_label.setText(f"检查结果失败: {error}")
+                return
+            exists = payload.get("exists", False)
+            if exists:
+                n = payload.get("num_points", 0)
+                size = _format_size(payload.get("size_bytes", 0))
+                self.download_btn.setEnabled(True)
+                self.result_label.setText(
+                    f"✅ 已有过滤结果\n"
+                    f"  输出: {payload.get('output_path', '')}\n"
+                    f"  点数: {n:,}  |  大小: {size}"
+                )
+                self._status_label.setText("已有过滤结果，可下载")
+            else:
+                self.result_label.setText("暂无过滤结果，请先运行过滤。")
+                self._status_label.setText("暂无过滤结果")
+
+        # ── 运行过滤 ──
+        elif tag == "filter_run":
+            self._set_running(False)
+            if error:
+                self._log_msg(f"✗ 过滤失败: {error}")
+                self.result_label.setText(f"❌ 过滤失败\n{error}")
+                self._status_label.setText("过滤失败")
+                QMessageBox.warning(self, "过滤失败", str(error))
+            else:
+                data = payload.get("data", {})
+                before = data.get("num_points_before", 0)
+                after = data.get("num_points_after", 0)
+                output_path = data.get("output_path", "")
+                self._log_msg(
+                    f"✓ 过滤完成: {after:,} / {before:,} 点 → {output_path}"
+                )
+                self.result_label.setText(
+                    f"✅ 过滤完成\n"
+                    f"  过滤前: {before:,} 点\n"
+                    f"  过滤后: {after:,} 点\n"
+                    f"  保留率: {100 * after / before:.1f}%\n"
+                    f"  输出: {output_path}"
+                )
+                self._status_label.setText("✓ 过滤完成，可下载")
+                self.download_btn.setEnabled(True)
+
+    # ------------------------------------------------------------------
+    # 下载完成
+    # ------------------------------------------------------------------
+
+    def _on_download_finished(self, reply: QNetworkReply):
+        save_path = reply.property("_save_path")
+        project = reply.property("_project")
+        self.download_btn.setEnabled(True)
+        self.download_btn.setText("⬇ 下载过滤后点云")
+        try:
+            if reply.error() != QNetworkReply.NoError:
+                err_text = bytes(reply.readAll()).decode("utf-8", errors="replace")
+                self._log_msg(f"✗ 下载失败: {err_text or reply.errorString()}")
+                self._status_label.setText("下载失败")
+                QMessageBox.warning(self, "下载失败", str(err_text or reply.errorString()))
+                return
+            data = bytes(reply.readAll())
+            with open(save_path, "wb") as f:
+                f.write(data)
+            self._log_msg(
+                f"✅ 下载完成: {save_path} ({_format_size(len(data))})"
+            )
+            self._status_label.setText("✓ 下载完成")
+        except OSError as e:
+            self._log_msg(f"✗ 写入文件失败: {e}")
+            self._status_label.setText("下载失败")
+            QMessageBox.warning(self, "下载失败", str(e))
+        finally:
+            reply.deleteLater()
+
+    # ------------------------------------------------------------------
+    # 辅助
+    # ------------------------------------------------------------------
+
+    def _set_running(self, running: bool):
+        self._running = running
+        self.run_btn.setEnabled(not running)
+        self.project_combo.setEnabled(not running)
+        self.threshold_spin.setEnabled(not running)
+        self.prompt_edit.setEnabled(not running)
+        self.progress.setVisible(running)
+        if running:
+            self.run_btn.setText("⏳ 过滤中...")
+        else:
+            self.run_btn.setText("▶ 运行点云过滤")
+
+    def _log_msg(self, text: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._log.append(f"[{ts}] {text}")

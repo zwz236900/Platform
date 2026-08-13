@@ -474,6 +474,65 @@ async def filter_project_pointcloud(
     }
 
 
+@app.get("/api/projects/{project_name}/filter/result")
+async def filter_result_status(project_name: str):
+    """Return status of the filtered point cloud (exists, size, point count).
+
+    Reads only the PLY header to count vertices — cheap even for large files.
+    """
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    out = _sfm_output_dir(project_name).parent / "algorithm_output" / "filtered_scene.ply"
+    if not out.exists():
+        return {"exists": False, "output_path": "", "size_bytes": 0, "num_points": 0}
+
+    try:
+        n = _count_ply_points(out)
+    except Exception:
+        n = 0
+
+    return {
+        "exists": True,
+        "output_path": str(out),
+        "size_bytes": out.stat().st_size,
+        "num_points": n,
+    }
+
+
+@app.get("/api/projects/{project_name}/filter/download/{filename:path}")
+async def download_filter_file(project_name: str, filename: str):
+    """Download a result file from algorithm_output directory."""
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    safe_path = os.path.normpath(filename)
+    if safe_path.startswith("..") or safe_path.startswith("/"):
+        raise HTTPException(400, "Invalid filename")
+
+    out_dir = _sfm_output_dir(project_name).parent / "algorithm_output"
+    file_path = out_dir / safe_path
+    if not file_path.exists():
+        raise HTTPException(404, f"File not found: {filename}")
+
+    return FileResponse(file_path, filename=Path(filename).name,
+                        media_type="application/octet-stream")
+
+
+def _count_ply_points(path: Path) -> int:
+    """Count vertices in a PLY by reading only its header."""
+    with open(path, "rb") as f:
+        while True:
+            line = f.readline().decode("ascii", errors="replace").strip()
+            if line.startswith("element vertex "):
+                return int(line.split()[2])
+            if line == "end_header":
+                break
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # API Routes — Pipeline
 # ---------------------------------------------------------------------------
@@ -1363,16 +1422,29 @@ async def get_mvs_log(project_name: str, lines: int = 100,
 
 
 @app.get("/api/projects/{project_name}/mvs/result")
-async def get_mvs_result(project_name: str):
-    """Get MVS pipeline result (mvs_pipeline_result.json)."""
+async def get_mvs_result(project_name: str, mvs_type: str = "openmvs"):
+    """Get MVS pipeline result (mvs_pipeline_result.json).
+
+    Query params:
+        mvs_type: MVS 引擎类型（openmvs / colmap），各自读自己的结果文件。
+            - openmvs: MVS_output/openmvs/mvs_pipeline_result.json（兼容旧布局 MVS_output/ 根目录）
+            - colmap:  SFM_output/pipeline_result.json
+    """
     _check_mvs_completion(project_name)
 
     p = get_project(project_name)
     if p is None:
         raise HTTPException(404, "Project not found")
 
-    from modules.task_manager import _mvs_result_json
-    result_path = _mvs_result_json(project_name)
+    if mvs_type == "colmap":
+        result_path = _sfm_output_dir(project_name) / "pipeline_result.json"
+    else:
+        # 区分引擎：openmvs 结果写在 MVS_output/openmvs/ 子目录
+        from modules.task_manager import _mvs_result_json
+        result_path = _mvs_result_json(project_name, "openmvs")
+        if not result_path.exists():
+            # 兼容旧布局：结果直接写在 MVS_output/ 根目录
+            result_path = _mvs_output_dir(project_name) / "mvs_pipeline_result.json"
 
     if not result_path.exists():
         return {
@@ -1386,6 +1458,20 @@ async def get_mvs_result(project_name: str):
             data = json.load(f)
     except (json.JSONDecodeError, OSError):
         return {"project_name": project_name, "ready": False, "message": "Failed to parse MVS results."}
+
+    if mvs_type == "colmap":
+        # colmap 的 pipeline_result.json 结构与 openmvs 不同，做一次映射
+        pipeline = data.get("pipeline") or {}
+        steps = {}
+        for name in pipeline.get("steps_completed", []):
+            steps[name] = {"status": "ok", "elapsed": None, "output": ""}
+        return {
+            "project_name": project_name,
+            "ready": True,
+            "status": "ok" if steps else "pending",
+            "steps": steps,
+            "total_elapsed": pipeline.get("elapsed_seconds"),
+        }
 
     return {
         "project_name": project_name,
