@@ -144,8 +144,9 @@ def _start_pipeline(project_name: str) -> None:
 
     # Strip IPTC/EXIF metadata before pipeline to prevent OpenImageIO crash
     prep_result = strip_metadata(project_name)
-    logger.info("Project %r: pre-run metadata check — success=%s, processed=%s",
-                project_name, prep_result.get("success"), prep_result.get("processed"))
+    logger.info("Project %r: pre-run metadata check — success=%s, processed=%s, error=%s",
+                project_name, prep_result.get("success"), prep_result.get("processed"),
+                prep_result.get("error"))
 
     cmd = build_sfm_command(
         project_name,

@@ -75,8 +75,7 @@ zstd -d < /mnt/g/docker-backups/pointr-data-20260814.tar.zst | tar -C /home/zwz/
 
 ### gs3（平台/gs:latest）
 ```bash
-docker run -d --name gs3 --gpus all -m 4g --shm-size=64m \
-  -v /home/zwz/Code/3DGS:/workspace/3DGS \
+docker run -d --name gs3 --gpus all -m 8g --shm-size=4g \
   -v /home/zwz/Code/DATA:/data \
   -w /workspace/3DGS \
   --entrypoint bash platform/gs:latest -c "while true; do sleep 3600; done"
@@ -85,8 +84,6 @@ docker run -d --name gs3 --gpus all -m 4g --shm-size=64m \
 ### sam3（platform/sam:latest）
 ```bash
 docker run -d --name sam3 --gpus all --shm-size=8g \
-  -v /home/zwz/Code/platform/shared_data:/shared_data \
-  -v /home/zwz/Code/SAM:/workspace \
   -v /home/zwz/Code/DATA:/data \
   -w /workspace \
   --entrypoint /opt/nvidia/nvidia_entrypoint.sh platform/sam:latest \
@@ -97,8 +94,6 @@ docker run -d --name sam3 --gpus all --shm-size=8g \
 ```bash
 docker run -d --name colmap-dev --gpus all --shm-size=8g \
   -v /home/zwz/Code/DATA:/data \
-  -v /home/zwz/Code/platform/shared_data:/shared_data \
-  -v /home/zwz/Code/SFM/colmap:/colmap \
   -w /colmap \
   --entrypoint /opt/nvidia/nvidia_entrypoint.sh platform/colmap:latest \
   bash -c "while true; do sleep 3600; done"
@@ -108,9 +103,7 @@ docker run -d --name colmap-dev --gpus all --shm-size=8g \
 
 ```bash
 docker run -d --name PoinTr --gpus all --shm-size=8g \
-  -v /home/zwz/Code/PoinTr:/workspace \
   -v /home/zwz/Code/DATA:/data \
-  -v /home/zwz/Code/platform/shared_data:/shared_data \
   -w /workspace \
   platform/pointr:latest bash -c "while true; do sleep 3600; done"
 ```
@@ -123,28 +116,11 @@ docker run -d --name PoinTr --gpus all --shm-size=8g \
 ```bash
 docker run -d --name openmvs --gpus all --shm-size=64m \
   -v /home/zwz/Code/DATA:/data \
-  -v /home/zwz/Code/MVS:/workspace/MVS \
   openmvs/openmvs-ubuntu:latest tail -f /dev/null
 ```
 
 ---
 
-## 4. 当前 Docker 状态（2026-08-14）
-
-**Docker 已完全清空**（所有镜像 + 容器均已删除，全部已备份）：
-
-| 原镜像                        | 容器       | 备份位置                                 |
-| ----------------------------- | ---------- | ---------------------------------------- |
-| platform/gs:latest            | gs3        | C盘 platform-gs-20260813.tar.zst         |
-| platform/colmap:latest        | colmap-dev | C盘 platform-colmap-20260813.tar.zst     |
-| platform/sam:latest           | sam3       | C盘 platform-sam-20260813.tar.zst        |
-| platform/pointr:latest        | PoinTr     | C盘 platform-pointr-20260814.tar.zst     |
-| openmvs/openmvs-ubuntu:latest | openmvs    | G盘 openmvs-20260814.tar.zst             |
-| PoinTr data 数据集            | —          | G盘 pointr-data-20260814.tar.zst (9.6GB) |
-
-> 恢复时先 `docker load` 镜像，再按第 3 节命令重建容器，data 解压回
-> `/home/zwz/Code/PoinTr/data`。宿主机代码文件夹（3DGS/SAM/SFM/PoinTr/MVS 等）
-> 仍在 `/home/zwz/Code/` 下，未受影响。
 
 ---
 

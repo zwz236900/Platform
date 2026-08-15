@@ -9,6 +9,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from modules.docker_runner import _ensure_colmap_running
 from modules.logger import get_logger
 
 logger = get_logger(__name__)
@@ -58,10 +59,18 @@ def strip_metadata(project_name: str) -> dict:
         success (bool)
         processed (int) — number of files actually touched
         error (str | None) — error message if the command failed
+
+    Note: the colmap-dev container is not persistent — it is started on demand.
+    This function ensures it is running before calling exiftool, instead of
+    silently skipping (which would let the problematic metadata reach COLMAP
+    and crash undistortion with the OpenImageIO IPTC assertion).
     """
-    if not is_container_running():
-        logger.warning("Project %r: colmap-dev container not running — skip preprocessing", project_name)
-        return {"success": False, "processed": 0, "error": "container not running"}
+    try:
+        _ensure_colmap_running()
+    except RuntimeError as e:
+        logger.warning("Project %r: cannot start colmap-dev container for metadata stripping: %s",
+                       project_name, e)
+        return {"success": False, "processed": 0, "error": str(e)}
 
     image_dir = DATA_DIR_CONTAINER / project_name / "Input" / "input_image"
     if not (DATA_DIR_HOST / project_name / "Input" / "input_image").is_dir():
@@ -133,11 +142,16 @@ def undistort_images(project_name: str) -> dict:
         output_dir (str) — host path to the undistorted directory
         num_images (int) — number of undistorted images written
         error (str | None) — error message if the command failed
+
+    Note: ensures the colmap-dev container is running (started on demand) rather
+    than skipping when it is stopped.
     """
-    if not is_container_running():
-        logger.warning("Project %r: colmap-dev container not running — skip undistort", project_name)
-        return {"success": False, "output_dir": "", "num_images": 0,
-                "error": "container not running"}
+    try:
+        _ensure_colmap_running()
+    except RuntimeError as e:
+        logger.warning("Project %r: cannot start colmap-dev container for undistortion: %s",
+                       project_name, e)
+        return {"success": False, "output_dir": "", "num_images": 0, "error": str(e)}
 
     # Prerequisites
     image_dir_host = DATA_DIR_HOST / project_name / "Input" / "input_image"
