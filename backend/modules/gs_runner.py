@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -58,7 +59,8 @@ def build_gs_command(
     sfm_dir = DATA_DIR_CONTAINER / project_name / "SFM_output" / "dense" / "sparse"
 
     cmd = [
-        "docker", "exec", "-e", "PYTHONUNBUFFERED=1", CONTAINER_NAME,
+        "docker", "exec", "--user", f"{os.getuid()}:{os.getgid()}",
+        "-e", "PYTHONUNBUFFERED=1", CONTAINER_NAME,
         "python3", GS_CLI_PATH,
         command,
         "--source", str(source_dir),

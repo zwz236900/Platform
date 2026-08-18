@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -48,7 +49,8 @@ def build_sam_command(
     output_dir = DATA_DIR_CONTAINER / project_name / "SAM_output"
 
     cmd = [
-        "docker", "exec", "-e", "PYTHONUNBUFFERED=1", CONTAINER_NAME,
+        "docker", "exec", "--user", f"{os.getuid()}:{os.getgid()}",
+        "-e", "PYTHONUNBUFFERED=1", CONTAINER_NAME,
         "python3", SAM_CLI_PATH,
         "--input-dir", str(image_dir),
         "--prompts", *prompts,

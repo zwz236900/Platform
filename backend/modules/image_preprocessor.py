@@ -6,6 +6,7 @@ functions that are wrapped in ``asyncio.to_thread`` by the async routes in main.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -83,7 +84,7 @@ def strip_metadata(project_name: str) -> dict:
         ext_args += ["-ext", ext.lstrip(".")]
 
     cmd = [
-        "docker", "exec", CONTAINER_NAME,
+        "docker", "exec", "--user", f"{os.getuid()}:{os.getgid()}", CONTAINER_NAME,
         "exiftool", "-all=", "-overwrite_original",
         *ext_args,
         str(image_dir) + "/",
@@ -178,7 +179,7 @@ def undistort_images(project_name: str) -> dict:
         shutil.rmtree(output_dir_host)
 
     cmd = [
-        "docker", "exec", CONTAINER_NAME,
+        "docker", "exec", "--user", f"{os.getuid()}:{os.getgid()}", CONTAINER_NAME,
         "colmap", "image_undistorter",
         "--image_path", str(image_dir_container),
         "--input_path", str(sparse_dir_container),

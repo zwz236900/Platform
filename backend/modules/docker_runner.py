@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -55,7 +56,9 @@ def build_sfm_command(
     steps_str = ",".join(steps) if steps else "extract,match,sfm,undistort,mvs"
 
     cmd = [
-        "docker", "exec", "-e", "PYTHONUNBUFFERED=1", CONTAINER_NAME,
+        # 以宿主用户身份运行，保证 /data 产物归属 zwz（容器默认 root，产物后端删不掉）
+        "docker", "exec", "--user", f"{os.getuid()}:{os.getgid()}",
+        "-e", "PYTHONUNBUFFERED=1", CONTAINER_NAME,
         "python3", SFM_CLI_PATH,
         "--image_dir", str(image_dir),
         "--output_dir", str(output_dir),

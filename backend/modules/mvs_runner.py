@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -57,7 +58,7 @@ def build_mvs_command(
     # openmvs 容器为 Ubuntu 18.04 + Python 3.6（ascii locale），非 ASCII 项目名
     # 会被 surrogateescape 解成代理字符 → 加 UTF-8 locale 保证 argv 正确解码。
     cmd = [
-        "docker", "exec",
+        "docker", "exec", "--user", f"{os.getuid()}:{os.getgid()}",
         "-e", "LANG=C.UTF-8", "-e", "LC_ALL=C.UTF-8",
         CONTAINER_NAME,
         "python3", MVS_CLI_PATH,

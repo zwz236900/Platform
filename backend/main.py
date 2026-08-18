@@ -765,31 +765,6 @@ async def _ensure_sam3_container() -> None:
     )
 
 
-# SAM scripts live in the SAM repo dir, mounted at /workspace inside sam3.
-SAM_SCRIPTS_DIR = Path("/home/zwz/Code/SAM")
-
-
-async def _setup_sam_script() -> None:
-    """Sync SAM_box.py / SAM_point.py / sam_worker.py into the SAM dir (mounted at /workspace)."""
-    algo_dir = Path(__file__).parent / "algorithm"
-
-    box_src = algo_dir / "SAM_box.py"
-    box_dst = SAM_SCRIPTS_DIR / "sam_box.py"
-    if box_src.exists() and not box_dst.exists():
-        shutil.copy(box_src, box_dst)
-
-    point_src = algo_dir / "SAM_point.py"
-    point_dst = SAM_SCRIPTS_DIR / "sam_point.py"
-    if point_src.exists() and not point_dst.exists():
-        shutil.copy(point_src, point_dst)
-
-    # Also sync SAM_CLI.py (serve-mode worker) — always copy latest
-    cli_src = SAM_SCRIPTS_DIR / "SAM_CLI.py"
-    cli_dst = SAM_SCRIPTS_DIR / "sam_worker.py"
-    if cli_src.exists():
-        shutil.copy(cli_src, cli_dst)
-
-
 # ---------------------------------------------------------------------------
 # 持久 SAM Worker 管理（模型常驻 GPU）
 # ---------------------------------------------------------------------------
@@ -808,7 +783,6 @@ async def _ensure_sam3_worker() -> None:
     global _worker_proc
 
     await _ensure_sam3_container()
-    await _setup_sam_script()
 
     # Already running?
     if _worker_proc is not None:
@@ -829,7 +803,7 @@ async def _ensure_sam3_worker() -> None:
 
     logger.info("Starting persistent SAM worker...")
     proc = await asyncio.create_subprocess_exec(
-        "docker", "exec", "-i", "sam3",
+        "docker", "exec", "--user", f"{os.getuid()}:{os.getgid()}", "-i", "sam3",
         "python3", "/workspace/sam_worker.py",
         "--serve",
         "--checkpoint", "/workspace/model/sam3.pt",
@@ -951,7 +925,6 @@ async def sam_box_segment(
     container_output = f"/data/{project_name}/SAM_output/box_results"
     stem = Path(safe).stem
 
-    await _setup_sam_script()
     await _ensure_sam3_worker()
 
     logger.info("Project %r: SAM box-segment on %s box=(%d,%d,%d,%d)",
@@ -1026,7 +999,6 @@ async def sam_point_segment(
     container_output = f"/data/{project_name}/SAM_output/point_results"
     stem = Path(safe).stem
 
-    await _setup_sam_script()
     await _ensure_sam3_worker()
 
     pos_count = sum(1 for pt in point_list if (pt[2] if len(pt) > 2 else 1) == 1)
@@ -1069,7 +1041,6 @@ async def sam_warmup(project_name: str):
     Uses the first available image in the project to trigger model loading.
     """
     """Pre-load the SAM model to GPU by starting the persistent worker."""
-    await _setup_sam_script()
     await _ensure_sam3_worker()
     return {"success": True, "message": "SAM model loaded to GPU"}
 
