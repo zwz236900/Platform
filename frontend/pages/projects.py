@@ -121,6 +121,38 @@ class ApiClient(QWidget):
         reply.setProperty("_path", path)
         reply.finished.connect(lambda: self._on_finished(reply))
 
+    def upload_single(self, file_path: str, url_path: str,
+                      field: str = "file", tag: str = ""):
+        """上传单个文件到指定接口（multipart/form-data）。"""
+        multi_part = QHttpMultiPart(QHttpMultiPart.FormDataType)
+
+        file_part = QHttpPart()
+        filename = Path(file_path).name
+        file_part.setHeader(
+            QNetworkRequest.ContentDispositionHeader,
+            f'form-data; name="{field}"; filename="{filename}"',
+        )
+        file_part.setHeader(
+            QNetworkRequest.ContentTypeHeader,
+            "application/octet-stream",
+        )
+        qfile = QFile(file_path)
+        if not qfile.open(QIODevice.ReadOnly):
+            return
+        qfile.setParent(multi_part)
+        file_part.setBodyDevice(qfile)
+        multi_part.append(file_part)
+
+        url = QUrl(API_BASE + url_path)
+        req = QNetworkRequest(url)
+        reply = self._mgr.post(req, multi_part)
+        multi_part.setParent(reply)
+
+        reply.setProperty("_tag", tag)
+        reply.setProperty("_method", "POST")
+        reply.setProperty("_path", url_path)
+        reply.finished.connect(lambda: self._on_finished(reply))
+
     def _request(self, method: str, path: str,
                  form_data: dict[str, str] | None = None,
                  tag: str = ""):
@@ -815,7 +847,12 @@ class ProjectsPage(BasePage):
         self._projects: dict[str, dict] = {}          # 缓存列表数据
         self._selected_project: str = ""               # 当前选中
         self._detail_loaded: set[str] = set()          # 已加载详情的项目
-        self._pending_uploads: list[str] = []           # 待上传文件（创建后）
+        self._pending_uploads: list[str] = []           # 待上传文件（图片/压缩包，创建后）
+        self._pending_videos: list[str] = []            # 待上传视频（创建后 → 弹抽帧框）
+        self._video_upload_queue: list[str] = []        # 逐个上传的队列
+        self._videos_remaining: int = 0                 # 尚未上传完的视频数
+        self._images_batch_pending: bool = False        # 图片批次是否仍在路上
+        self._create_fallback: QTimer | None = None     # 创建兜底计时器（大视频需更长）
 
         # --- 操作栏 ---
         toolbar = QHBoxLayout()
@@ -906,24 +943,29 @@ class ProjectsPage(BasePage):
                 self._reset_create_btn()
             else:
                 project_name = payload.get("data", {}).get("project_name", "")
-                # 如果有待上传文件，先上传再刷新
-                if self._pending_uploads and project_name:
-                    self._status_label.setText(f"项目已创建，正在上传 {len(self._pending_uploads)} 个文件...")
+                if not project_name:
+                    self._status_label.setText("⚠ 创建失败：响应缺少项目名")
+                    self._reset_create_btn()
+                    return
+                # 发起剩余上传：图片/压缩包一批，视频逐个
+                self._images_batch_pending = bool(self._pending_uploads)
+                if self._images_batch_pending:
+                    self._status_label.setText(
+                        f"项目已创建，正在上传 {len(self._pending_uploads)} 个文件..."
+                    )
                     self._api.upload_files(
                         project_name, self._pending_uploads,
                         tag=f"upload_to:{project_name}",
                     )
                     self._pending_uploads = []
-                else:
+                self._video_upload_queue = list(self._pending_videos)
+                self._videos_remaining = len(self._video_upload_queue)
+                # 无任何上传时直接显示已创建（有上传时由各自分支/收尾更新文案）
+                if not self._images_batch_pending and self._videos_remaining == 0:
                     self._status_label.setText(f"✓ 项目 {project_name} 已创建")
-                    self._refresh_list()
-                    if project_name:
-                        self._selected_project = project_name
-                        self._load_project_detail(project_name)
-                        self._state.set_current(project_name)
-                    self._reset_create_btn()
+                self._maybe_finish_creation(project_name)
 
-        # ── 文件上传响应 ──
+        # ── 图片/压缩包上传响应 ──
         elif tag.startswith("upload_to:"):
             project_name = tag.split(":", 1)[1]
             if error:
@@ -936,12 +978,18 @@ class ProjectsPage(BasePage):
                 self._status_label.setText(
                     f"✓ 项目 {project_name} 已创建，{num_images} 张图片已上传"
                 )
-            self._refresh_list()
-            if project_name:
-                self._selected_project = project_name
-                self._load_project_detail(project_name)
-                self._state.set_current(project_name)
-            self._reset_create_btn()
+            self._images_batch_pending = False
+            self._maybe_finish_creation(project_name)
+
+        # ── 单个视频上传响应 ──
+        elif tag.startswith("upload_video:"):
+            project_name = tag.split(":", 1)[1]
+            if error:
+                QMessageBox.warning(
+                    self, "视频上传失败",
+                    f"项目已创建，但视频上传失败：{error}",
+                )
+            self._maybe_finish_creation(project_name)
 
         # ── 删除项目响应 ──
         elif tag == "delete_project":
@@ -1104,16 +1152,93 @@ class ProjectsPage(BasePage):
         name = dialog.project_name()
         files = dialog.files()
 
+        # 视频与图片/压缩包分流：图片走原批量上传，视频逐个传后弹抽帧框
+        self._pending_uploads = [f for f in files
+                                 if Path(f).suffix.lower() not in VIDEO_EXTS]
+        self._pending_videos = [f for f in files
+                                if Path(f).suffix.lower() in VIDEO_EXTS]
+        self._video_upload_queue = list(self._pending_videos)
+        self._videos_remaining = len(self._video_upload_queue)
+        self._images_batch_pending = False
+
         self._create_btn.setEnabled(False)
         self._create_btn.setText("创建中...")
-        self._pending_uploads = files
         self._api.post("/api/projects", {"name": name}, tag="create_project")
-        # 兜底：如果 10 秒后还没恢复就重置按钮
-        QTimer.singleShot(10000, self._reset_create_btn)
+        # 兜底：视频可能很大，上传/抽帧窗口放宽到 2 分钟
+        if self._create_fallback:
+            self._create_fallback.stop()
+            self._create_fallback.deleteLater()
+        self._create_fallback = QTimer(self)
+        self._create_fallback.setSingleShot(True)
+        self._create_fallback.timeout.connect(self._reset_create_btn)
+        self._create_fallback.start(120000 if files else 10000)
 
     def _reset_create_btn(self):
+        if self._create_fallback:
+            self._create_fallback.stop()
+            self._create_fallback.deleteLater()
+            self._create_fallback = None
         self._create_btn.setEnabled(True)
         self._create_btn.setText("＋ 新建项目")
+
+    # ------------------------------------------------------------------
+    # 新建收尾：图片/视频全部上传完后 → 抽帧弹窗（有视频）→ 统一刷新
+    # ------------------------------------------------------------------
+
+    def _start_next_video_upload(self, project_name: str):
+        """逐个上传待处理视频（后端逐条校验，串行更稳）。"""
+        if self._videos_remaining <= 0 or not self._video_upload_queue:
+            return
+        path = self._video_upload_queue.pop(0)
+        self._videos_remaining -= 1
+        self._status_label.setText(f"正在上传视频 {Path(path).name} ...")
+        self._api.upload_single(
+            path,
+            f"/api/projects/{project_name}/videos",
+            field="video",
+            tag=f"upload_video:{project_name}",
+        )
+
+    def _maybe_finish_creation(self, project_name: str):
+        """所有上传都落地后才进入下一步（否则继续排队上传）。"""
+        if self._images_batch_pending:
+            return
+        if self._videos_remaining > 0:
+            self._start_next_video_upload(project_name)
+            return
+        self._finish_create_finalize(project_name)
+
+    def _finish_create_finalize(self, project_name: str):
+        """上传阶段结束：有视频则弹抽帧框，之后统一收尾刷新。"""
+        self._reset_create_btn()
+        if self._pending_videos:
+            # 延后一帧再开模态框，避免在响应回调内重入
+            QTimer.singleShot(0, lambda: self._run_extract_dialog(project_name))
+        else:
+            self._finalize_after_create(project_name, None)
+
+    def _run_extract_dialog(self, project_name: str):
+        from widgets.video_extract_dialog import VideoExtractDialog
+        dlg = VideoExtractDialog(project_name, self._api, API_BASE, self)
+        dlg.exec()
+        frames = dlg.result_frame_count()
+        self._finalize_after_create(project_name, frames)
+
+    def _finalize_after_create(self, project_name: str, frame_count):
+        self._pending_videos = []
+        self._video_upload_queue = []
+        self._selected_project = project_name
+        self._state.set_current(project_name)
+        self._refresh_list()
+        self._load_project_detail(project_name)
+        # 仅在有视频流程时覆盖状态文案；纯图片/无上传由原分支文案负责
+        if frame_count is not None:
+            if frame_count:
+                self._status_label.setText(
+                    f"✓ 项目 {project_name} 已创建，视频抽帧完成（共 {frame_count} 帧）"
+                )
+            else:
+                self._status_label.setText(f"✓ 项目 {project_name} 已创建（未抽帧）")
 
     def _on_delete_project(self, project_name: str):
         # 二次确认

@@ -66,6 +66,7 @@ from modules.sam_runner import (
     remove_sam_process,
     run_sam_async,
 )
+from modules.video_api import video_router
 from modules.task_manager import (
     DATA_DIR,
     _algorithm_output_dir,
@@ -92,6 +93,9 @@ FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 
 app = FastAPI(title="SfM Platform", version="0.2.0")
 
+# 视频抽帧（video_processor/video_runner/video_api）
+app.include_router(video_router)
+
 
 @app.on_event("startup")
 async def _startup():
@@ -112,23 +116,125 @@ async def log_requests(request: Request, call_next):
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _last_run_steps(project_name: str) -> list[str] | None:
+    """Steps of the newest pipeline run, from its ``=== PIPELINE START`` line.
+
+    Returns None when the log is missing/unparseable — callers then fall back
+    to trusting the result file (legacy behaviour) rather than guessing.
+    """
+    lp = _sfm_output_dir(project_name) / "pipeline.log"
+    if not lp.is_file():
+        return None
+    try:
+        with open(lp, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if line.startswith("=== PIPELINE START"):
+            idx = line.find(" --steps ")
+            if idx < 0:
+                return None
+            tail = line[idx + len(" --steps "):].split()
+            if not tail:
+                return None
+            return [s.strip() for s in tail[0].split(",") if s.strip()]
+    return None
+
+
+def _pipeline_result_matches_run(project_name: str) -> bool:
+    """Is pipeline_result.json the product of the newest run (not a stale one)?
+
+    sfm_cli.py writes pipeline_result.json only at the very end of a run, and
+    records the exact steps_requested. docker exec's client exit code is NOT
+    trustworthy — when the kernel OOM-kills colmap (-9) mid-run the wrapper
+    often still exits 0, leaving an old result file behind. So a result only
+    counts as this run's output when its requested steps equal the newest
+    ``=== PIPELINE START``'s ``--steps``.
+    """
+    want = _last_run_steps(project_name)
+    if want is None:
+        return True  # cannot verify → keep legacy behaviour
+    from modules.task_manager import load_pipeline_result
+    result = load_pipeline_result(project_name)
+    if result is None:
+        return False
+    requested = (result.get("pipeline") or {}).get("steps_requested", [])
+    if isinstance(requested, str):
+        requested = [s.strip() for s in requested.split(",") if s.strip()]
+    return sorted(requested) == sorted(want)
+
+
+def _mark_pipeline_failed(project_name: str, message: str) -> None:
+    update_project(
+        project_name,
+        status=TaskStatus.FAILED.value,
+        error_message=message,
+        finished_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def _reconcile_orphan_colmap(project_name: str) -> None:
+    """Resolve a task stuck in ``running`` whose runner registry entry is gone.
+
+    Happens when a pipeline survives a backend restart: docker_runner's
+    in-memory ``_running_processes`` dies with the old process, but sfm_cli.py
+    keeps running inside colmap-dev (and keeps writing depth maps). When that
+    container process is still alive we leave the task running — the /progress
+    endpoint counts its artifacts live. When it is gone the run ended without a
+    host callback, so we settle status from pipeline_result.json **only if it
+    belongs to the newest run** (see _pipeline_result_matches_run); otherwise
+    the run was interrupted (OOM kill, crash, …) → failed.
+    """
+    p = get_project(project_name)
+    if p is None or p.get("status") != TaskStatus.RUNNING.value:
+        return
+
+    # Imported lazily to keep pipeline_progress (which imports docker_runner +
+    # mvs_runner) from touching this module's import graph.
+    from modules.pipeline_progress import _colmap_process_alive
+    if _colmap_process_alive(project_name):
+        return  # genuinely still running (orphan) — live progress continues
+
+    if _pipeline_result_matches_run(project_name):
+        sync_project_from_result(project_name)
+    else:
+        logger.warning(
+            "Project %r: orphan run ended without its own result file — "
+            "marking failed (interrupted / OOM)", project_name)
+        _mark_pipeline_failed(
+            project_name,
+            "运行中断（进程已结束，未产出本次运行的结果——疑似被系统终止，如内存不足）")
+
+
 def _check_process_completion(project_name: str) -> None:
     """If the process for project has exited, sync results and clean up."""
     proc = get_process(project_name)
     if proc is None:
+        # No registry entry: nothing running, or a container process orphaned by
+        # a backend restart. Reconcile a stuck ``running`` task either way.
+        _reconcile_orphan_colmap(project_name)
         return
     if proc.poll() is not None:
-        if proc.returncode == 0:
+        if proc.returncode == 0 and _pipeline_result_matches_run(project_name):
             logger.info("Project %r pipeline finished successfully", project_name)
             sync_project_from_result(project_name)
         else:
-            logger.error("Project %r pipeline FAILED (exit code %s)", project_name, proc.returncode)
-            update_project(
-                project_name,
-                status=TaskStatus.FAILED.value,
-                error_message=f"Pipeline exited with code {proc.returncode}",
-                finished_at=datetime.now(timezone.utc).isoformat(),
-            )
+            if proc.returncode == 0:
+                # docker exec returned 0 but no result for THIS run was written
+                # (classic OOM signature: colmap killed -9, wrapper survived).
+                logger.error(
+                    "Project %r pipeline exit 0 but no matching result — "
+                    "likely OOM-killed mid-run", project_name)
+                _mark_pipeline_failed(
+                    project_name,
+                    "运行中断（进程退出码为 0 但未产出本次结果——疑似内存不足 OOM 被杀）")
+            else:
+                logger.error("Project %r pipeline FAILED (exit code %s)",
+                             project_name, proc.returncode)
+                _mark_pipeline_failed(
+                    project_name,
+                    f"Pipeline exited with code {proc.returncode}")
         remove_process(project_name)
 
 
@@ -668,6 +774,24 @@ async def get_pipeline_log(project_name: str, lines: int = 100):
         raise HTTPException(404, "Project not found")
     log_text = get_log_tail(project_name, lines=lines)
     return {"project_name": project_name, "log": log_text or "(no log yet)"}
+
+
+@app.get("/api/projects/{project_name}/progress")
+async def get_pipeline_progress(project_name: str):
+    """Host-side pipeline progress snapshot (steps + determinate MVS %).
+
+    The GUI polls this while COLMAP/OpenMVS is running to drive a determinate
+    progress bar and a step label. COLMAP's colmap stdout is buffered by
+    sfm_cli.py, so the MVS phase is measured by counting the per-image depth
+    maps colmap writes onto the bind-mounted DATA dir.
+    """
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    from modules.pipeline_progress import compute_pipeline_progress
+
+    return compute_pipeline_progress(project_name)
 
 
 @app.get("/api/projects/{project_name}/download/{filename:path}")
@@ -1336,7 +1460,9 @@ async def run_mvs_pipeline(
 
     if mvs_type == "colmap":
         # --- COLMAP MVS ---
-        if is_process_running(project_name):
+        # 注册表 + 容器内孤儿进程（后端重启后仍活着）都算“正在运行”
+        from modules.pipeline_progress import _colmap_process_alive
+        if is_process_running(project_name) or _colmap_process_alive(project_name):
             raise HTTPException(400, "COLMAP pipeline is already running")
 
         from modules.docker_runner import build_sfm_command, run_pipeline_async as run_colmap_async
@@ -1418,6 +1544,105 @@ async def run_mvs_pipeline(
         "success": True,
         "message": f"OpenMVS {command} started for {project_name}",
         "data": {"mvs_type": "openmvs", "command": command},
+    }
+
+
+@app.post("/api/projects/{project_name}/mvs/resume")
+async def resume_colmap_mvs(project_name: str):
+    """断点续算 COLMAP MVS（不清历史深度图）。
+
+    项目的 COLMAP MVS（或整条 SfM+MVS）被中断/被杀后，MVS_output/colmap
+    （去畸变 images + PINHOLE sparse + stereo/patch-match.cfg + 部分 depth_maps）
+    通常还在。此端点对**同一 workspace** 直接重跑 patch_match_stereo +
+    stereo_fusion —— colmap 会跳过已有深度图/法向图的影像只补缺（见
+    PatchMatchController::ProcessProblem 的 ExistsFile 短路），因此**不经过
+    reuse 步骤**，也就不会像 GUI 普通重跑那样先把 stereo 整目录删掉再拷空的。
+
+    前置条件：
+      - MVS_output/colmap 已由之前的 undistort/reuse 就绪（有 images/sparse/
+        stereo/patch-match.cfg）；
+      - 当前没有其他 COLMAP 管线在写该 workspace（注册表进程或容器内孤儿都算）；
+      - 尚未生成 fused.ply（若深度图已齐且 fused.ply 已存在即算完成，拒绝）。
+    """
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    # colmap 同一 workspace 是否已有别的 sfm_cli.py 在跑（注册表或容器内孤儿都算）。
+    # 惰性 import 与 run_mvs_pipeline / _reconcile_orphan_colmap 保持一致。
+    from modules.pipeline_progress import (
+        _colmap_process_alive,
+        _depth_stats,
+        _patch_match_refs,
+    )
+    if is_process_running(project_name) or _colmap_process_alive(project_name):
+        raise HTTPException(
+            400,
+            "COLMAP pipeline 正在运行（可能仍在写同一 workspace）——请等它结束后再续算")
+
+    workspace = _mvs_output_dir(project_name, "colmap")
+    cfg = workspace / "stereo" / "patch-match.cfg"
+    if not ((workspace / "images").is_dir()
+            and (workspace / "sparse").is_dir() and cfg.is_file()):
+        raise HTTPException(
+            400,
+            f"{workspace} 尚无可用续算的工作区（缺 images/sparse/"
+            "stereo/patch-match.cfg）。请先跑一次完整的 COLMAP MVS 生成初始 workspace。")
+
+    refs = _patch_match_refs(workspace)
+    if not refs:
+        raise HTTPException(400, "stereo/patch-match.cfg 为空或不可读，无法续算")
+
+    stats = _depth_stats(workspace)
+    photo, geo = stats["photometric"], stats["geometric"]
+
+    fused_ply = workspace / "fused.ply"
+    if photo >= refs and geo >= refs and fused_ply.is_file():
+        raise HTTPException(
+            400,
+            f"深度图已齐（photometric {photo}/{refs}、geometric {geo}/{refs}）"
+            f"且 {fused_ply.name} 已存在——已完成，无需续算")
+
+    # 本 app 的 COLMAP MVS 固定两趟（geom_consistency=true），续算沿用同一布局，
+    # 否则与存量 .photometric.bin / .geometric.bin 不一致会让 fusion 读不到图。
+    from modules.docker_runner import (
+        build_sfm_command,
+        run_pipeline_async as run_colmap_async,
+    )
+    config = p.get("config", {})
+    cmd = build_sfm_command(
+        project_name,
+        steps=["mvs"],
+        use_gpu=config.get("use_gpu", True),
+        gpu_index=config.get("gpu_index", 0),
+        mvs_type="colmap",
+    )
+    logger.info("Project %r: resuming COLMAP MVS (no reuse) — %s",
+                project_name, " ".join(cmd))
+    await asyncio.to_thread(run_colmap_async, project_name, cmd)
+    update_project(
+        project_name,
+        status=TaskStatus.RUNNING.value,
+        started_at=datetime.now(timezone.utc).isoformat(),
+        error_message=None,
+    )
+
+    miss_photo = max(refs - photo, 0)
+    miss_geo = max(refs - geo, 0)
+    msg = (f"COLMAP MVS 续算已启动：已有 photometric {photo}/{refs}、"
+           f"geometric {geo}/{refs}，将补算 {miss_photo} 张 photometric、"
+           f"{miss_geo} 张 geometric 后执行融合")
+    return {
+        "success": True,
+        "message": msg,
+        "data": {
+            "mvs_type": "colmap",
+            "steps": ["mvs"],
+            "reused_workspace": True,
+            "photo_done": photo,
+            "geo_done": geo,
+            "refs": refs,
+        },
     }
 
 

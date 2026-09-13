@@ -304,6 +304,16 @@ class MvsPage(BasePage):
 
         btn_row.addStretch()
 
+        self.resume_btn = QPushButton("↻ 断点续算")
+        self.resume_btn.setObjectName("actionBtn")
+        self.resume_btn.setMinimumWidth(110)
+        self.resume_btn.setToolTip(
+            "COLMAP MVS 中断/被杀后断点续算：基于 MVS_output/colmap 已有的深度图，"
+            "跳过已算好的影像只补缺（不经 reuse，不清历史）。仅对 COLMAP 引擎有效。"
+        )
+        self.resume_btn.clicked.connect(self._on_resume)
+        btn_row.addWidget(self.resume_btn)
+
         self.run_btn = QPushButton("▶ 运行 MVS")
         self.run_btn.setObjectName("primaryBtn")
         self.run_btn.setMinimumWidth(120)
@@ -311,6 +321,16 @@ class MvsPage(BasePage):
         btn_row.addWidget(self.run_btn)
 
         self.content_layout.addLayout(btn_row)
+
+        # ── 进度区：步骤文案 + 详情 + 进度条 ──
+        self._step_label = QLabel("")
+        self._step_label.setStyleSheet("color:#e6edf3; font-size:13px; font-weight:600;")
+        self._step_label.setVisible(False)
+        self._detail_label = QLabel("")
+        self._detail_label.setStyleSheet("color:#8b949e; font-size:12px;")
+        self._detail_label.setVisible(False)
+        self.content_layout.addWidget(self._step_label)
+        self.content_layout.addWidget(self._detail_label)
 
         # ── 进度条 ──
         self.progress = QProgressBar()
@@ -413,6 +433,7 @@ class MvsPage(BasePage):
         self._current_project = project
         if project:
             self._check_result()
+            self._probe_active_run()
         self._update_download_files()
 
     def _on_shared_project_changed(self, project: str):
@@ -567,6 +588,39 @@ class MvsPage(BasePage):
             tag="mvs_run",
         )
 
+    def _on_resume(self):
+        """断点续算 COLMAP MVS（不清历史深度图，跳过已算好的只补缺）。"""
+        project = self.project_combo.currentText().strip()
+        if not project:
+            QMessageBox.warning(self, "提示", "请先选择一个项目。")
+            return
+
+        # 续算只对 COLMAP MVS 有意义：自动把引擎切到 colmap（与 _probe_active_run 的
+        # 切换一致，保证 /mvs/result 按 colmap 判定完成）。
+        idx = self.mvs_type_combo.findData("colmap")
+        if idx < 0:
+            QMessageBox.warning(self, "提示", "无 COLMAP 引擎项，无法续算。")
+            return
+        if self.mvs_type_combo.currentData() != "colmap":
+            self.mvs_type_combo.blockSignals(True)
+            self.mvs_type_combo.setCurrentIndex(idx)
+            self.mvs_type_combo.blockSignals(False)
+            self._current_mvs_type = "colmap"
+            self._repopulate_commands()
+            self._sync_download_engine()
+
+        self._current_project = project
+        self._set_running(True)
+        self._status_label.setText("续算启动中...")
+        self.result_label.setText("⏳ 正在请求断点续算...")
+        self._log_msg(f"↻ 请求 COLMAP MVS 断点续算 — 项目: {project}")
+
+        self._api.post(
+            f"/api/projects/{project}/mvs/resume",
+            {},
+            tag="mvs_resume",
+        )
+
     # ------------------------------------------------------------------
     # 轮询日志与结果
     # ------------------------------------------------------------------
@@ -581,6 +635,28 @@ class MvsPage(BasePage):
         )
         # 每 tick 都查后端运行状态：进程退出即落定，据此判定完成
         self._check_result()
+        # 每 tick 都查确定性进度（步骤 + MVS 深度图计数），驱动进度条
+        self._poll_progress()
+
+    def _poll_progress(self):
+        if not self._current_project:
+            return
+        self._api.get(
+            f"/api/projects/{self._current_project}/progress",
+            tag="mvs_progress",
+        )
+
+    def _probe_active_run(self):
+        """进入页面/切换项目时探测：该项目是否已有管线在跑（含后端重启后
+        仍在容器里跑的孤儿 COLMAP）。有则自动进入运行态并恢复轮询，否则停在
+        就绪态 —— 否则已运行的 MVS 永远不显示进度。
+        """
+        if self._running or not self._current_project:
+            return
+        self._api.get(
+            f"/api/projects/{self._current_project}/progress",
+            tag="mvs_probe",
+        )
 
     def _check_result(self):
         self._api.get(
@@ -666,6 +742,25 @@ class MvsPage(BasePage):
                 self._poll_log()
                 self._poll_timer.start()
 
+        # ── 断点续算启动响应 ──
+        elif tag == "mvs_resume":
+            if error:
+                self._set_running(False)
+                self._log_msg(f"✗ 续算启动失败: {error}")
+                self._status_label.setText("续算未启动")
+                QMessageBox.warning(self, "续算启动失败", str(error))
+            else:
+                message = payload.get("message", "COLMAP MVS 续算已启动")
+                self._log_msg(f"✓ {message}")
+                data = payload.get("data") or {}
+                if data.get("refs"):
+                    self._log_msg(
+                        f"  已有 photometric {data.get('photo_done')}/{data.get('refs')}、"
+                        f"geometric {data.get('geo_done')}/{data.get('refs')}，续算中…")
+                self._status_label.setText("MVS 续算运行中...")
+                self._poll_log()
+                self._poll_timer.start()
+
         # ── 日志轮询（仅展示；完成判定以后端 /mvs/result 的 run_status 为准）──
         elif tag == "mvs_poll_log":
             log_text = payload.get("log", "")
@@ -688,6 +783,53 @@ class MvsPage(BasePage):
                     f"{item['step']} · {item['label']}", item["path"])
             self.dl_file_combo.blockSignals(False)
             self._dl_status.setText("暂无产物可下载" if not products else "")
+
+        # ── 恢复已存在运行：探测到运行中 → 进入运行态并开始轮询 ──
+        elif tag == "mvs_probe":
+            if self._running or error:
+                return
+            if not payload.get("running"):
+                return
+            kind = payload.get("kind")
+            if kind in ("colmap", "openmvs"):
+                # 把引擎下拉框对齐到实际在跑的引擎，保证 /mvs/result 判完成正确
+                idx = self.mvs_type_combo.findData(kind)
+                if idx >= 0 and self.mvs_type_combo.currentData() != kind:
+                    self.mvs_type_combo.blockSignals(True)
+                    self.mvs_type_combo.setCurrentIndex(idx)
+                    self.mvs_type_combo.blockSignals(False)
+                    self._current_mvs_type = kind
+                    self._repopulate_commands()
+            self._log_msg("↻ 检测到该项目已有 MVS 在运行，恢复进度监控…")
+            self._status_label.setText("MVS 运行中...")
+            self._set_running(True)
+            self._poll_log()
+            self._poll_timer.start()
+
+        # ── 确定性进度（步骤标签 + MVS 深度图计数百分比）──
+        elif tag == "mvs_progress":
+            # 仅在运行期间渲染；结束/空闲的迟到响应一律忽略
+            if not self._running or error:
+                return
+            if not payload.get("running"):
+                return
+            label = payload.get("label") or ""
+            detail = payload.get("detail") or ""
+            percent = payload.get("percent")
+
+            if label:
+                self._step_label.setText(label)
+                self._step_label.setVisible(True)
+            if isinstance(percent, (int, float)):
+                # 确定值：两趟深度图计数驱动（COLAMP PatchMatch）
+                self.progress.setRange(0, 100)
+                self.progress.setValue(int(round(percent)))
+                if detail:
+                    self._detail_label.setText(detail)
+                    self._detail_label.setVisible(True)
+            else:
+                # 无法计数（特征/匹配/SfM 或 OpenMVS）：保持滚动条 + 步骤文案
+                self.progress.setRange(0, 0)
 
         # ── 结果查询（含后端运行状态，据此判定完成）──
         elif tag == "mvs_result":
@@ -795,10 +937,15 @@ class MvsPage(BasePage):
     def _set_running(self, running: bool):
         self._running = running
         self.run_btn.setEnabled(not running)
+        self.resume_btn.setEnabled(not running)
         self.project_combo.setEnabled(not running)
         self.mvs_type_combo.setEnabled(not running)
         self.command_combo.setEnabled(not running)
         self.progress.setVisible(running)
+        self.progress.setRange(0, 0)  # 每次重开先回到滚动态，等首个 /progress 结果
+        # 步骤/详情文案只在运行期间显示，先隐藏避免残留上一轮内容
+        self._step_label.setVisible(False)
+        self._detail_label.setVisible(False)
         if running:
             self.run_btn.setText("⏳ 运行中...")
         else:
@@ -808,6 +955,9 @@ class MvsPage(BasePage):
         super().showEvent(event)
         # 进入页面时重新拉取列表，让「别处选中的项目」也能同步到下拉框
         self._load_projects()
+        # 探测是否有已存在的运行：恢复监控（页面打开前就已在跑的任务）
+        if self._current_project:
+            self._probe_active_run()
 
     def _log_msg(self, text: str):
         ts = datetime.now().strftime("%H:%M:%S")

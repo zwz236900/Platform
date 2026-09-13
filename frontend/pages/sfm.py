@@ -166,6 +166,16 @@ class SfMPage(BasePage):
         btn_row.addWidget(self.stop_btn)
         self.content_layout.addLayout(btn_row)
 
+        # ── 进度区：步骤文案 + 详情 + 进度条 ──
+        self._step_label = QLabel("")
+        self._step_label.setStyleSheet("color:#e6edf3; font-size:13px; font-weight:600;")
+        self._step_label.setVisible(False)
+        self._detail_label = QLabel("")
+        self._detail_label.setStyleSheet("color:#8b949e; font-size:12px;")
+        self._detail_label.setVisible(False)
+        self.content_layout.addWidget(self._step_label)
+        self.content_layout.addWidget(self._detail_label)
+
         # ── 进度条 ──
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)  # indeterminate
@@ -298,6 +308,11 @@ class SfMPage(BasePage):
                 f"/api/projects/{self._current_project}/log?lines=40",
                 tag="poll_log",
             )
+        # 每 tick 都查确定性进度（步骤 + MVS 深度图计数），驱动进度条
+        self._api.get(
+            f"/api/projects/{self._current_project}/progress",
+            tag="sfm_progress",
+        )
 
     # ------------------------------------------------------------------
     # 网络响应
@@ -364,6 +379,31 @@ class SfMPage(BasePage):
                 self._log_msg("✗ Pipeline 失败，请检查日志。")
                 self._status_label.setText("Pipeline 失败")
 
+        # ── 确定性进度（步骤标签 + MVS 深度图计数百分比）──
+        elif tag == "sfm_progress":
+            # 仅在运行期间渲染；结束/空闲的迟到响应一律忽略
+            if not self._running or error:
+                return
+            if not payload.get("running"):
+                return
+            label = payload.get("label") or ""
+            detail = payload.get("detail") or ""
+            percent = payload.get("percent")
+
+            if label:
+                self._step_label.setText(label)
+                self._step_label.setVisible(True)
+            if isinstance(percent, (int, float)):
+                # 确定值：两趟深度图计数驱动（COLAMP PatchMatch）
+                self.progress.setRange(0, 100)
+                self.progress.setValue(int(round(percent)))
+                if detail:
+                    self._detail_label.setText(detail)
+                    self._detail_label.setVisible(True)
+            else:
+                # 无法计数（特征/匹配/SfM）：保持滚动条 + 步骤文案
+                self.progress.setRange(0, 0)
+
         # ── 项目详情（用于检查运行状态）──
         elif tag == "check_status":
             status = payload.get("status", "")
@@ -394,6 +434,9 @@ class SfMPage(BasePage):
         self.stop_btn.setVisible(running)
         self.project_combo.setEnabled(not running)
         self.progress.setVisible(running)
+        # 步骤/详情文案只在运行期间显示，先隐藏避免残留上一轮内容
+        self._step_label.setVisible(False)
+        self._detail_label.setVisible(False)
         if running:
             self.run_btn.setText("⏳ 运行中...")
             self.progress.setRange(0, 0)
