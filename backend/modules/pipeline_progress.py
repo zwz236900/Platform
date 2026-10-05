@@ -127,10 +127,14 @@ def _geom_consistency(log_path: Path) -> bool | None:
             text = f.read()
     except OSError:
         return None
-    m = re.search(r"--PatchMatchStereo\.geom_consistency\s+(\S+)", text)
-    if not m:
+    # Last match, not first: pipeline.log is appended to across runs, so an
+    # earlier run's flag would otherwise mask the newest one -- e.g. a project
+    # re-run with geometric consistency off would keep reporting two-pass and
+    # the depth-map counts would never add up.
+    found = re.findall(r"--PatchMatchStereo\.geom_consistency\s+(\S+)", text)
+    if not found:
         return None
-    val = m.group(1).strip().lower()
+    val = found[-1].strip().lower()
     if val == "true":
         return True
     if val == "false":
@@ -167,10 +171,12 @@ def _depth_stats(workspace: Path) -> dict:
     """Count depth-map files, split by pass.
 
     geom_consistency on  → <img>.photometric.bin then <img>.geometric.bin
-    geom_consistency off → a single <img>.bin per reference image.
+    geom_consistency off → a single <img>.photometric.bin per reference image
+        (the "geometric" suffix names the second pass, not the first — see
+        patch_match.cc, which picks the suffix straight off the flag).
     """
     depth_dir = workspace / "stereo" / "depth_maps"
-    stats = {"photometric": 0, "geometric": 0, "plain": 0, "present": False}
+    stats = {"photometric": 0, "geometric": 0, "present": False}
     if not depth_dir.is_dir():
         return stats
     try:
@@ -183,8 +189,6 @@ def _depth_stats(workspace: Path) -> dict:
             stats["photometric"] += 1
         elif name.endswith(".geometric.bin"):
             stats["geometric"] += 1
-        elif name.endswith(".bin"):
-            stats["plain"] += 1
     return stats
 
 
@@ -195,7 +199,7 @@ def _mvs_progress(workspace: Path, geom: bool | None) -> dict:
     """
     refs = _patch_match_refs(workspace)
     stats = _depth_stats(workspace)
-    photo, geo, plain = stats["photometric"], stats["geometric"], stats["plain"]
+    photo, geo = stats["photometric"], stats["geometric"]
 
     # Decide effective mode from layout if the echoed flag is unavailable.
     two_pass = True if geom is None else geom
@@ -212,8 +216,10 @@ def _mvs_progress(workspace: Path, geom: bool | None) -> dict:
         else:
             detail = f"已生成 {done} 张深度图"
     else:
+        # Single pass still lands in the photometric bucket, so the same sum is
+        # right here; counting only "plain .bin" files would always read 0.
         total = refs
-        done = plain
+        done = photo + geo
         detail = f"PatchMatch 深度图 {done}/{refs}" if refs is not None else "正在生成深度图"
 
     if total is None:
@@ -222,7 +228,7 @@ def _mvs_progress(workspace: Path, geom: bool | None) -> dict:
         total = max(total, 1)
         percent = round(100.0 * min(done, total) / total, 1)
         if done >= total and stats["present"]:
-            detail += "（两趟均已生成）"
+            detail += "（两趟均已生成）" if two_pass else "（深度图已生成）"
 
     return {"percent": percent, "done": done, "total": total,
             "detail": detail, "geom_two_pass": two_pass}

@@ -99,6 +99,20 @@ docker run -d --name colmap-dev --gpus all --shm-size=8g \
   bash -c "while true; do sleep 3600; done"
 ```
 
+> ⚠️ **建完这个容器必须再跑一次 CLI 回写脚本**：
+>
+> ```bash
+> /home/zwz/Code/Platform/work/colmap_cli/sync_to_container.sh
+> ```
+>
+> 原因：`/colmap/sfm_cli.py`（MVS 超参数 CLI）是**烘焙进镜像**的，宿主上改的那份
+> 容器读不到；MVS 页面暴露的 20 个 COLMAP 稠密重建参数全部经由它透传。恢复镜像或
+> 重建容器后会退回**旧版脚本**，前端参数将全部被静默忽略。
+> 回写脚本会 `docker cp` 并做 `py_compile` 校验。
+> 彻底办法（需重建容器时加）：给这一个文件挂载
+> `-v /home/zwz/Code/Platform/work/colmap_cli/sfm_cli.py:/colmap/sfm_cli.py`；
+> **不要**整目录挂载 `/colmap`——那会遮住镜像里约 6.7GB 的 COLMAP 源码与构建树。
+
 ### PoinTr（platform/pointr:latest）— 已导出
 
 ```bash

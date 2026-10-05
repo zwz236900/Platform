@@ -10,9 +10,11 @@ import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
+from pydantic import ValidationError
 
 from modules.docker_logger import start_global_monitor
 from modules.docker_runner import (
@@ -29,6 +31,7 @@ from algorithm.mask_obj import run as run_mask_obj
 from modules.logger import get_logger, request_log
 from modules.models import (
     CameraModel,
+    ColmapMVSParams,
     MatcherType,
     MVSCommand,
     MVSConfig,
@@ -247,6 +250,7 @@ def _start_pipeline(project_name: str) -> None:
 
     config_dict = p.get("config", {})
     steps = config_dict.get("steps", ["extract", "match", "sfm", "undistort", "mvs"])
+    mvs_params, _ = _stored_colmap_mvs(p)
 
     # Strip IPTC/EXIF metadata before pipeline to prevent OpenImageIO crash
     prep_result = strip_metadata(project_name)
@@ -268,6 +272,7 @@ def _start_pipeline(project_name: str) -> None:
         vocab_tree_path=config_dict.get("vocab_tree_path"),
         convert_output_suffix=config_dict.get("convert_output_suffix", "txt"),
         mvs_type=config_dict.get("mvs_type", "colmap"),
+        mvs_params=mvs_params,
     )
 
     logger.info("Project %r starting pipeline: %s", project_name, " ".join(cmd))
@@ -673,6 +678,104 @@ def _count_ply_points(path: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
+# COLMAP MVS tunables — request plumbing
+# ---------------------------------------------------------------------------
+
+#: Top-level project key holding the last COLMAP MVS settings. Deliberately NOT
+#: inside "config": update_project is a shallow dict.update, so writing
+#: config=... replaces the whole dict and would drop the SfM settings
+#: _start_pipeline reads back. Same precedent as OpenMVS's "mvs_config".
+COLMAP_MVS_PARAMS_KEY = "colmap_mvs_params"
+
+
+async def colmap_mvs_form(
+    pms_max_image_size: Optional[int] = Form(default=None),
+    pms_window_radius: Optional[int] = Form(default=None),
+    pms_window_step: Optional[int] = Form(default=None),
+    pms_num_samples: Optional[int] = Form(default=None),
+    pms_num_iterations: Optional[int] = Form(default=None),
+    pms_cache_size: Optional[int] = Form(default=None),
+    pms_geom_consistency_max_cost: Optional[float] = Form(default=None),
+    pms_filter: Optional[int] = Form(default=None),
+    pms_filter_min_ncc: Optional[float] = Form(default=None),
+    pms_filter_min_triangulation_angle: Optional[float] = Form(default=None),
+    pms_filter_min_num_consistent: Optional[int] = Form(default=None),
+    pms_filter_geom_consistency_max_cost: Optional[float] = Form(default=None),
+    fusion_input_type: Optional[str] = Form(default=None),
+    fusion_max_image_size: Optional[int] = Form(default=None),
+    fusion_min_num_pixels: Optional[int] = Form(default=None),
+    fusion_max_num_pixels: Optional[int] = Form(default=None),
+    fusion_max_reproj_error: Optional[float] = Form(default=None),
+    fusion_max_depth_error: Optional[float] = Form(default=None),
+    fusion_max_normal_error: Optional[float] = Form(default=None),
+    fusion_check_num_images: Optional[int] = Form(default=None),
+) -> ColmapMVSParams:
+    """Gather the COLMAP dense-reconstruction tunables from flat form fields.
+
+    Declared field-by-field on purpose. Binding an ``Annotated[ColmapMVSParams,
+    Form()]`` model alongside ``/mvs/run``'s existing scalar Form parameters
+    makes FastAPI embed it as a single nested field, so the flat fields the
+    client actually sends are silently dropped — HTTP 200 with every value
+    null. Scalar Form parameters have no such trap.
+
+    Bounds live on the model, not on ``Form(...)``, so an out-of-range value
+    comes back as a readable 400 naming the field while a non-numeric one stays
+    FastAPI's own 422. Every field defaults to None = "let COLMAP decide", so a
+    request that sets nothing produces no flags at all.
+    """
+    try:
+        return ColmapMVSParams(
+            pms_max_image_size=pms_max_image_size,
+            pms_window_radius=pms_window_radius,
+            pms_window_step=pms_window_step,
+            pms_num_samples=pms_num_samples,
+            pms_num_iterations=pms_num_iterations,
+            pms_cache_size=pms_cache_size,
+            pms_geom_consistency_max_cost=pms_geom_consistency_max_cost,
+            pms_filter=pms_filter,
+            pms_filter_min_ncc=pms_filter_min_ncc,
+            pms_filter_min_triangulation_angle=pms_filter_min_triangulation_angle,
+            pms_filter_min_num_consistent=pms_filter_min_num_consistent,
+            pms_filter_geom_consistency_max_cost=pms_filter_geom_consistency_max_cost,
+            fusion_input_type=fusion_input_type,
+            fusion_max_image_size=fusion_max_image_size,
+            fusion_min_num_pixels=fusion_min_num_pixels,
+            fusion_max_num_pixels=fusion_max_num_pixels,
+            fusion_max_reproj_error=fusion_max_reproj_error,
+            fusion_max_depth_error=fusion_max_depth_error,
+            fusion_max_normal_error=fusion_max_normal_error,
+            fusion_check_num_images=fusion_check_num_images,
+        )
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        # loc is empty for whole-model validators (the min/max pixel check),
+        # where naming a field would be misleading.
+        field = ".".join(str(part) for part in first["loc"])
+        msg = str(first["msg"]).removeprefix("Value error, ")
+        where = f"{field} — " if field else ""
+        raise HTTPException(400, f"COLMAP MVS 参数不合法：{where}{msg}")
+
+
+def _stored_colmap_mvs(project: dict) -> tuple[ColmapMVSParams, bool]:
+    """Rebuild persisted COLMAP MVS settings as ``(params, no_geom_consistency)``.
+
+    The geometric-consistency switch rides along in the same dict because it and
+    the fusion ``input_type`` must agree (see the CLI's auto-selection); keeping
+    them in one place means resume cannot read back a mismatched pair. Projects
+    from before these knobs existed have no such key and get plain defaults.
+    """
+    stored = dict(project.get(COLMAP_MVS_PARAMS_KEY) or {})
+    geom_off = bool(stored.pop("no_geom_consistency", False))
+    try:
+        return ColmapMVSParams(**stored), geom_off
+    except ValidationError:
+        # Only reachable via a hand-edited task.json. Fall back to defaults
+        # rather than blocking the run, but say so in the log.
+        logger.warning("Ignoring unreadable %s: %r", COLMAP_MVS_PARAMS_KEY, stored)
+        return ColmapMVSParams(), geom_off
+
+
+# ---------------------------------------------------------------------------
 # API Routes — Pipeline
 # ---------------------------------------------------------------------------
 
@@ -690,6 +793,7 @@ async def run_pipeline(
     reconstruction_name: str = Form(default="0"),
     convert_output_suffix: str = Form(default="txt"),
     mvs_type: str = Form(default="colmap"),
+    mvs_params: ColmapMVSParams = Depends(colmap_mvs_form),
 ):
     """Configure and run the SfM pipeline for a project."""
     p = get_project(project_name)
@@ -727,7 +831,17 @@ async def run_pipeline(
         convert_output_suffix=convert_output_suffix,
     )
 
-    update_project(project_name, config=config.model_dump())
+    # config is replaced wholesale here (that is this endpoint's contract), but
+    # the MVS tunables still go in their own key: resume reads them from there,
+    # and _start_pipeline resolves both keys the same way for every entry point.
+    update_project(
+        project_name,
+        config=config.model_dump(),
+        **{COLMAP_MVS_PARAMS_KEY: {
+            **mvs_params.model_dump(exclude_none=True),
+            "no_geom_consistency": no_geom_consistency,
+        }},
+    )
     logger.info("Project %r: config updated, starting pipeline", project_name)
     await asyncio.to_thread(_start_pipeline, project_name)
 
@@ -1448,8 +1562,14 @@ async def run_mvs_pipeline(
     gradient_step: float = Form(default=45.0),
     texture_resolution: int = Form(default=1),
     export_type: str = Form(default="ply"),
+    no_geom_consistency: bool = Form(default=False),
+    mvs_params: ColmapMVSParams = Depends(colmap_mvs_form),
 ):
-    """Run an MVS pipeline step (COLMAP or OpenMVS) for a project."""
+    """Run an MVS pipeline step (COLMAP or OpenMVS) for a project.
+
+    The dense-reconstruction tunables and ``no_geom_consistency`` are COLMAP
+    only; the OpenMVS branch below ignores them entirely.
+    """
     p = get_project(project_name)
     if p is None:
         raise HTTPException(404, "Project not found")
@@ -1475,18 +1595,37 @@ async def run_mvs_pipeline(
         steps = ["reuse", "mvs"] if can_reuse else ["undistort", "mvs"]
         reuse_dense_dir = f"/data/{project_name}/SFM_output/dense" if can_reuse else None
 
+        # 几何一致性关掉时只有 .photometric.bin，fusion 读 geometric 会产出空点云。
+        # CLI 也会挡（同样报错退出），这里提前拦下给出可读的 400。
+        if mvs_params.fusion_input_type == "geometric" and no_geom_consistency:
+            raise HTTPException(
+                400,
+                "fusion_input_type=geometric 需要几何一致性（当前 no_geom_consistency=true）"
+                "——请改用 photometric 或 auto，或打开几何一致性")
+
         cmd = build_sfm_command(
             project_name,
             steps=steps,
             use_gpu=not no_cuda,
             gpu_index=0,
+            no_geom_consistency=no_geom_consistency,
             mvs_type="colmap",
             reuse_dense_dir=reuse_dense_dir,
+            mvs_params=mvs_params,
         )
         logger.info("Project %r: starting COLMAP MVS", project_name)
         # run_colmap_async 内部先确保 colmap-dev 容器在跑，成功后标记 RUNNING
         await asyncio.to_thread(run_colmap_async, project_name, cmd)
-        update_project(project_name, status=TaskStatus.RUNNING.value)
+        # 存下来供 resume 沿用：续算跑在同一 workspace 上，参数必须与原次一致。
+        # 写在启动成功之后——启动失败时 workspace 没动，旧参数才是对的那一份。
+        update_project(
+            project_name,
+            status=TaskStatus.RUNNING.value,
+            **{COLMAP_MVS_PARAMS_KEY: {
+                **mvs_params.model_dump(exclude_none=True),
+                "no_geom_consistency": no_geom_consistency,
+            }},
+        )
         return {
             "success": True,
             "message": f"COLMAP MVS started for {project_name}",
@@ -1593,6 +1732,17 @@ async def resume_colmap_mvs(project_name: str):
     if not refs:
         raise HTTPException(400, "stereo/patch-match.cfg 为空或不可读，无法续算")
 
+    # 续算不接收 UI 参数，一律沿用上次存的（同一 workspace 里新旧参数混算会让
+    # fusion 读到不一致的深度图）。历史项目无该键 → 全 None，行为同从前。
+    mvs_params, geom_off = _stored_colmap_mvs(p)
+    if geom_off:
+        # 关掉几何一致性时只写 .photometric.bin，单趟；下面的完成判据与
+        # _depth_stats 分桶都按两趟设计，续算会永远判不出「已齐」。
+        raise HTTPException(
+            400,
+            "该项目上次运行时关闭了几何一致性（单趟深度图，只有 .photometric.bin），"
+            "续算需要两趟布局。请重跑一次完整的 COLMAP MVS。")
+
     stats = _depth_stats(workspace)
     photo, geo = stats["photometric"], stats["geometric"]
 
@@ -1603,7 +1753,7 @@ async def resume_colmap_mvs(project_name: str):
             f"深度图已齐（photometric {photo}/{refs}、geometric {geo}/{refs}）"
             f"且 {fused_ply.name} 已存在——已完成，无需续算")
 
-    # 本 app 的 COLMAP MVS 固定两趟（geom_consistency=true），续算沿用同一布局，
+    # 续算沿用上次的两趟布局（geom_consistency=true，上面已挡掉 false），
     # 否则与存量 .photometric.bin / .geometric.bin 不一致会让 fusion 读不到图。
     from modules.docker_runner import (
         build_sfm_command,
@@ -1616,6 +1766,7 @@ async def resume_colmap_mvs(project_name: str):
         use_gpu=config.get("use_gpu", True),
         gpu_index=config.get("gpu_index", 0),
         mvs_type="colmap",
+        mvs_params=mvs_params,
     )
     logger.info("Project %r: resuming COLMAP MVS (no reuse) — %s",
                 project_name, " ".join(cmd))

@@ -83,8 +83,108 @@ _PARAM_GROUPS = {
     "left": ["resolution_level", "max_resolution", "min_resolution",
              "refine_resolution", "texture_resolution"],
     "right": ["number_views", "scales", "gradient_step", "model", "export_type"],
-    "gpu": ["no_cuda"],
+    "run": ["no_cuda", "no_geom_consistency"],
+    "patchmatch": [],  # 由 COLMAP_PATCHMATCH_PARAMS 填
+    "fusion": [],      # 由 COLMAP_FUSION_PARAMS 填
 }
+
+# ── COLMAP 稠密重建超参数 ────────────────────────────────────────────────
+# 分两张表，对应界面上两个可勾选的分组：勾上组标题才把该组参数发给后端，
+# 没勾就一个 flag 都不发 → COLMAP 用自己的默认值，也就是改动之前的行为。
+# 每个控件的初值即 COLMAP 自己的默认值，所以「只改一项」时同组其余项虽也被
+# 显式发送，数值仍与默认相同，结果不变。
+#
+# kind: int/float → QSpinBox/QDoubleSpinBox（lo..hi，初值 default）；
+#       choice    → QComboBox，发送 currentData()。
+# 范围与后端 ColmapMVSParams 的校验一致，避免界面能选出后端会拒的值。
+COLMAP_PATCHMATCH_PARAMS = [
+    {"key": "pms_max_image_size", "label": "最大边长", "kind": "int",
+     "lo": -1, "hi": 20000, "step": 50, "default": -1,
+     "hint": "深度图计算所用的最大图像边长，越小越快；-1 = 不限制（COLMAP 默认 -1）"},
+    {"key": "pms_window_radius", "label": "窗口半径", "kind": "int",
+     "lo": 1, "hi": 32, "step": 1, "default": 5,
+     "hint": "匹配窗口半径，弱纹理场景可加大；COLMAP 默认 5，上限 32"},
+    {"key": "pms_window_step", "label": "窗口步长", "kind": "int",
+     "lo": 1, "hi": 2, "step": 1, "default": 1,
+     "hint": "窗口滑动步长，2 更快但精度略降；COLMAP 默认 1"},
+    {"key": "pms_num_samples", "label": "采样数", "kind": "int",
+     "lo": 1, "hi": 200, "step": 1, "default": 15,
+     "hint": "每次迭代的深度采样数，越大越准也越慢；COLMAP 默认 15"},
+    {"key": "pms_num_iterations", "label": "迭代次数", "kind": "int",
+     "lo": 1, "hi": 100, "step": 1, "default": 5,
+     "hint": "PatchMatch 迭代次数；COLMAP 默认 5"},
+    {"key": "pms_cache_size", "label": "缓存 (GB)", "kind": "int",
+     "lo": 1, "hi": 512, "step": 1, "default": 32,
+     "hint": "图像/深度图缓存大小（GB）；COLMAP 默认 32"},
+    {"key": "pms_geom_consistency_max_cost", "label": "几何一致性阈值", "kind": "float",
+     "lo": 0.0, "hi": 100.0, "step": 0.1, "decimals": 2, "default": 3.0,
+     "hint": "几何一致性检查的最大代价，越小越严；COLMAP 默认 3"},
+    {"key": "pms_filter", "label": "深度图滤波", "kind": "choice",
+     "choices": [("1", "开启 (1)"), ("0", "关闭 (0)")], "default": "1",
+     "hint": "是否对深度图做一致性滤波；COLMAP 默认开启"},
+    {"key": "pms_filter_min_ncc", "label": "滤波最小 NCC", "kind": "float",
+     "lo": -1.0, "hi": 1.0, "step": 0.01, "decimals": 3, "default": 0.1,
+     "hint": "保留像素所需的最小 NCC 相似度，越大越严；COLMAP 默认 0.1"},
+    {"key": "pms_filter_min_triangulation_angle", "label": "滤波最小三角化角 (°)", "kind": "float",
+     "lo": 0.0, "hi": 179.9, "step": 0.5, "decimals": 1, "default": 3.0,
+     "hint": "保留像素所需的最小三角化角（度）；COLMAP 默认 3"},
+    {"key": "pms_filter_min_num_consistent", "label": "滤波最小一致视图数", "kind": "int",
+     "lo": 0, "hi": 32, "step": 1, "default": 2,
+     "hint": "至少多少张视图一致才保留该像素；COLMAP 默认 2"},
+    {"key": "pms_filter_geom_consistency_max_cost", "label": "滤波几何一致性阈值", "kind": "float",
+     "lo": 0.0, "hi": 100.0, "step": 0.1, "decimals": 2, "default": 1.0,
+     "hint": "滤波阶段的几何一致性最大代价；COLMAP 默认 1"},
+]
+
+COLMAP_FUSION_PARAMS = [
+    {"key": "fusion_input_type", "label": "融合输入类型", "kind": "choice",
+     "choices": [("auto", "auto（跟随几何一致性）"),
+                 ("geometric", "geometric（几何一致性结果）"),
+                 ("photometric", "photometric（光度一致性结果）")],
+     "default": "auto",
+     "hint": "读哪种深度图。auto 跟随几何一致性开关，是安全默认；\n"
+             "关了几何一致性却选 geometric 会融合不出点（后端会直接报错）"},
+    {"key": "fusion_max_image_size", "label": "最大边长", "kind": "int",
+     "lo": -1, "hi": 20000, "step": 50, "default": -1,
+     "hint": "融合所用的最大图像边长，越小越快；-1 = 不限制（COLMAP 默认 -1）"},
+    {"key": "fusion_min_num_pixels", "label": "最少像素数", "kind": "int",
+     "lo": 0, "hi": 1000, "step": 1, "default": 5,
+     "hint": "一个三维点至少要被多少像素观测到；COLMAP 默认 5"},
+    {"key": "fusion_max_num_pixels", "label": "最多像素数", "kind": "int",
+     "lo": 1, "hi": 100000, "step": 100, "default": 10000,
+     "hint": "一个三维点最多被多少像素观测到（滤掉重复纹理）；COLMAP 默认 10000"},
+    {"key": "fusion_max_reproj_error", "label": "最大重投影误差 (px)", "kind": "float",
+     "lo": 0.0, "hi": 50.0, "step": 0.1, "decimals": 2, "default": 2.0,
+     "hint": "融合允许的最大重投影误差（像素）；COLMAP 默认 2"},
+    {"key": "fusion_max_depth_error", "label": "最大深度误差", "kind": "float",
+     "lo": 0.0, "hi": 1.0, "step": 0.001, "decimals": 4, "default": 0.01,
+     "hint": "融合允许的最大相对深度误差；COLMAP 默认 0.01"},
+    {"key": "fusion_max_normal_error", "label": "最大法向误差 (°)", "kind": "float",
+     "lo": 0.0, "hi": 180.0, "step": 1.0, "decimals": 1, "default": 10.0,
+     "hint": "融合允许的最大法向夹角（度）；COLMAP 默认 10"},
+    {"key": "fusion_check_num_images", "label": "检查图像数", "kind": "int",
+     "lo": 1, "hi": 500, "step": 1, "default": 50,
+     "hint": "每个点做一致性检查时抽看的图像数；COLMAP 默认 50"},
+]
+
+# 预设按钮：勾选哪些分组 + 组内要改成什么值（未列出的项保持 COLMAP 默认）。
+# 「均衡」只关掉覆盖开关、不动控件里的数字；「恢复默认」额外把数字也改回默认值。
+COLMAP_PRESETS = {
+    "快速预览": {"geom_off": True, "override": ("patchmatch",),
+                 "values": {"pms_window_step": 2, "pms_num_samples": 10, "pms_num_iterations": 3},
+                 "reset_values": False},
+    "均衡":     {"geom_off": False, "override": (), "values": {}, "reset_values": False},
+    "高精度":   {"geom_off": False, "override": ("patchmatch",),
+                 "values": {"pms_max_image_size": -1, "pms_window_step": 1,
+                            "pms_num_samples": 20, "pms_num_iterations": 8},
+                 "reset_values": False},
+    "恢复默认": {"geom_off": False, "override": (), "values": {}, "reset_values": True},
+}
+
+COLMAP_PARAM_KEYS = frozenset(
+    p["key"] for p in COLMAP_PATCHMATCH_PARAMS + COLMAP_FUSION_PARAMS)
+_PARAM_GROUPS["patchmatch"] = [p["key"] for p in COLMAP_PATCHMATCH_PARAMS]
+_PARAM_GROUPS["fusion"] = [p["key"] for p in COLMAP_FUSION_PARAMS]
 
 STEP_LABELS = {
     "interface": "导入",
@@ -112,6 +212,31 @@ def _format_size(n: int) -> str:
     if n >= 1 << 10:
         return f"{n / (1 << 10):.1f} KB"
     return f"{n} B"
+
+
+def _build_colmap_control(spec: dict):
+    """按 COLMAP_*_PARAMS 的 spec 造控件，初值即 COLMAP 自己的默认值。"""
+    if spec["kind"] == "choice":
+        combo = QComboBox()
+        for value, label in spec["choices"]:
+            combo.addItem(label, value)
+        idx = combo.findData(spec["default"])
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        combo.setToolTip(spec["hint"])
+        return combo
+
+    if spec["kind"] == "float":
+        spin: QSpinBox | QDoubleSpinBox = QDoubleSpinBox()
+        spin.setDecimals(spec.get("decimals", 2))
+    else:
+        spin = QSpinBox()
+    spin.setRange(spec["lo"], spec["hi"])
+    spin.setSingleStep(spec["step"])
+    spin.setKeyboardTracking(False)  # 输入过程中不发 valueChanged
+    spin.setValue(spec["default"])
+    spin.setToolTip(spec["hint"])
+    return spin
 
 
 class MvsPage(BasePage):
@@ -278,9 +403,9 @@ class MvsPage(BasePage):
         params.addWidget(right_group)
         self.right_group = right_group  # OpenMVS 专属：深度与选项
 
-        # GPU 开关：两个引擎共用。colmap 模式下隐藏上面两组 OpenMVS 参数，
-        # 只保留此开关（colmap 带 CUDA，no_cuda = 回退 CPU）。
-        gpu_group = QGroupBox("GPU 选项")
+        # 运行开关：两个引擎共用。colmap 模式下隐藏上面两组 OpenMVS 参数，
+        # 只保留此组（colmap 带 CUDA，no_cuda = 回退 CPU；几何一致性是 colmap 专有）。
+        gpu_group = QGroupBox("运行选项")
         gform = QFormLayout(gpu_group)
         self.no_cuda_check = QCheckBox("CPU 模式（当前构建无 GPU 加速）")
         self.no_cuda_check.setChecked(True)
@@ -289,10 +414,64 @@ class MvsPage(BasePage):
             "此开关仅透传 --no-cuda 标记，暂不影响实际运行结果。"
         )
         gform.addRow(self.no_cuda_check)
+
+        # COLMAP 专属：关掉几何一致性只跑一趟，快很多，但融合要跟着改用
+        # photometric（否则读不到深度图、产出空点云——后端已自动处理并拦错）。
+        self.geom_check = QCheckBox("关闭几何一致性（单趟，更快）")
+        self.geom_check.setToolTip(
+            "COLMAP 专属。勾选后 patch_match 只跑一趟（不生成 .geometric.bin），\n"
+            "速度快很多但深度图未经几何一致性校验；融合输入类型会自动改用\n"
+            "photometric。注意：这种布局不支持断点续算，中断后需整段重跑。"
+        )
+        gform.addRow(self.geom_check)
         params.addWidget(gpu_group)
         self.gpu_group = gpu_group
 
         self.content_layout.addLayout(params)
+
+        # ── COLMAP 稠密重建超参数（两组可勾选：勾上才覆盖，不勾即 COLMAP 默认）──
+        self._colmap_groups: dict[str, QGroupBox] = {}
+        self._colmap_forms: dict[str, QFormLayout] = {}
+        self._colmap_widgets: dict[str, QWidget] = {}
+        self._colmap_group_widgets: dict[str, list] = {}
+        colmap_params = QHBoxLayout()
+        colmap_params.setSpacing(12)
+        for gname, title, specs in (
+            ("patchmatch", "深度图 PatchMatch（勾选 = 覆盖 COLMAP 默认）", COLMAP_PATCHMATCH_PARAMS),
+            ("fusion", "深度融合 StereoFusion（勾选 = 覆盖 COLMAP 默认）", COLMAP_FUSION_PARAMS),
+        ):
+            group = QGroupBox(title)
+            group.setCheckable(True)
+            group.setChecked(False)  # 默认不覆盖 → 一个 flag 都不发
+            form = QFormLayout(group)
+            widgets = []
+            for spec in specs:
+                w = _build_colmap_control(spec)
+                form.addRow(spec["label"] + ":", w)
+                self._colmap_widgets[spec["key"]] = w
+                widgets.append(w)
+            self._colmap_groups[gname] = group
+            self._colmap_forms[gname] = form
+            self._colmap_group_widgets[gname] = widgets
+            group.toggled.connect(lambda on, g=gname: self._set_group_enabled(g, on))
+            self._set_group_enabled(gname, False)
+            colmap_params.addWidget(group)
+        self.content_layout.addLayout(colmap_params)
+
+        # 预设按钮排（只对 COLMAP 有意义）
+        self._preset_bar = QWidget()
+        preset_row = QHBoxLayout(self._preset_bar)
+        preset_row.setContentsMargins(0, 0, 0, 0)
+        preset_row.addWidget(QLabel("预设:"))
+        for name in COLMAP_PRESETS:
+            btn = QPushButton(name)
+            btn.setObjectName("actionBtn")
+            btn.setToolTip("一键填入一组常用参数组合（可再手动调整）")
+            btn.clicked.connect(lambda _=False, n=name: self._apply_preset(n))
+            preset_row.addWidget(btn)
+        preset_row.addStretch()
+        self._preset_bar.setVisible(False)
+        self.content_layout.addWidget(self._preset_bar)
 
         # ── 操作按钮 ──
         btn_row = QHBoxLayout()
@@ -408,12 +587,17 @@ class MvsPage(BasePage):
             "gradient_step": self.gradient_spin,
             "texture_resolution": self.texture_res_spin,
             "export_type": self.export_combo,
+            "no_geom_consistency": self.geom_check,
         }
         # 记录每个参数在所属 QFormLayout 中的行号，用于整行显隐——
         # 只 setVisible(False) 字段会让 label 文字残留，需 setRowVisible 连 label 一起隐藏。
+        # COLMAP 两组参数的表必须一并列入，否则它们的行永远不会被隐藏/显示。
+        self._param_widgets.update(self._colmap_widgets)
+        all_forms = (lform, rform, gform,
+                     self._colmap_forms["patchmatch"], self._colmap_forms["fusion"])
         self._param_rows: dict[str, tuple] = {}
         for key, w in self._param_widgets.items():
-            for form in (lform, rform, gform):
+            for form in all_forms:
                 row, _role = form.getWidgetPosition(w)
                 if row >= 0:
                     self._param_rows[key] = (form, row)
@@ -528,14 +712,20 @@ class MvsPage(BasePage):
             tag="mvs_files",
         )
 
+    def _set_group_enabled(self, group_name: str, on: bool):
+        """整组置灰/启用（组标题的勾选框控制是否覆盖 COLMAP 默认值）。"""
+        for w in self._colmap_group_widgets[group_name]:
+            w.setEnabled(on)
+
     def _on_command_changed(self):
         cmd = self.command_combo.currentData() or "pipeline"
         enabled = set(COMMAND_PARAMS.get(cmd, []))
         is_colmap = self._current_mvs_type == "colmap"
 
-        # 只展示当前命令实际用到的参数（openmvs 按命令显隐，colmap 只留 GPU 开关），
+        # 只展示当前命令实际用到的参数（openmvs 按命令显隐，colmap 显示稠密重建超参数），
         # 不再把全部参数摊开再置灰。整行隐藏（含 label），避免「输入框没了、文字还在」。
-        visible = {"no_cuda"} if is_colmap else enabled
+        visible = ({"no_cuda", "no_geom_consistency"} | COLMAP_PARAM_KEYS
+                   if is_colmap else enabled)
 
         for key, (form, row) in self._param_rows.items():
             form.setRowVisible(row, key in visible)
@@ -543,8 +733,54 @@ class MvsPage(BasePage):
         # 分组外壳：组内没有任何可见参数时整组隐藏（如 interface 只留模型、reconstruct 无参数）
         for gname, group in (("left", self.left_group),
                              ("right", self.right_group),
-                             ("gpu", self.gpu_group)):
+                             ("run", self.gpu_group),
+                             ("patchmatch", self._colmap_groups["patchmatch"]),
+                             ("fusion", self._colmap_groups["fusion"])):
             group.setVisible(any(k in visible for k in _PARAM_GROUPS[gname]))
+
+        # 预设按钮只对 COLMAP 有意义
+        self._preset_bar.setVisible(is_colmap)
+
+    # ------------------------------------------------------------------
+    # COLMAP 稠密重建超参数
+    # ------------------------------------------------------------------
+
+    def _apply_preset(self, name: str):
+        """一键填入一组常用参数（见 COLMAP_PRESETS），之后仍可手动改。"""
+        preset = COLMAP_PRESETS[name]
+        self.geom_check.setChecked(preset["geom_off"])
+        if preset["reset_values"]:
+            for specs in (COLMAP_PATCHMATCH_PARAMS, COLMAP_FUSION_PARAMS):
+                for spec in specs:
+                    self._set_colmap_value(spec["key"], spec["default"])
+        for key, value in preset["values"].items():
+            self._set_colmap_value(key, value)
+        # 勾选状态最后设：控件值先就位，避免 toggled 期间瞬时启用半套参数
+        for gname, group in self._colmap_groups.items():
+            group.setChecked(gname in preset["override"])
+        self._log_msg(f"  已应用预设「{name}」")
+
+    def _set_colmap_value(self, key: str, value):
+        w = self._colmap_widgets[key]
+        if isinstance(w, QComboBox):
+            idx = w.findData(str(value))
+            if idx >= 0:
+                w.setCurrentIndex(idx)
+        else:
+            w.setValue(value)
+
+    def _collect_colmap_params(self) -> dict:
+        """勾选了覆盖的分组才发送；没勾的组一个字段都不发 → COLMAP 用自己的默认值。"""
+        out: dict[str, str] = {}
+        for gname, specs in (("patchmatch", COLMAP_PATCHMATCH_PARAMS),
+                             ("fusion", COLMAP_FUSION_PARAMS)):
+            if not self._colmap_groups[gname].isChecked():
+                continue
+            for spec in specs:
+                w = self._colmap_widgets[spec["key"]]
+                out[spec["key"]] = (w.currentData() if isinstance(w, QComboBox)
+                                    else str(w.value()))
+        return out
 
     # ------------------------------------------------------------------
     # 运行
@@ -574,6 +810,10 @@ class MvsPage(BasePage):
             "texture_resolution": str(self.texture_res_spin.value()),
             "export_type": self.export_combo.currentText(),
         }
+        if mvs_type == "colmap":
+            # 稠密重建超参数（未勾选覆盖的组不发送 → COLMAP 默认）
+            config.update(self._collect_colmap_params())
+            config["no_geom_consistency"] = str(self.geom_check.isChecked()).lower()
 
         self._current_project = project
         self._set_running(True)

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from modules.docker_logger import LOG_DIR as DOCKER_LOG_DIR, start_follow
 from modules.logger import get_logger
+from modules.models import ColmapMVSParams
 
 logger = get_logger(__name__)
 
@@ -42,6 +43,7 @@ def build_sfm_command(
     convert_output_suffix: str = "txt",
     mvs_type: str = "colmap",
     reuse_dense_dir: str | None = None,
+    mvs_params: ColmapMVSParams | None = None,
 ) -> list[str]:
     """Build the docker exec command to run sfm_cli.py inside the container.
 
@@ -77,6 +79,14 @@ def build_sfm_command(
     if steps and any(s in ("mvs", "fusion") for s in steps):
         dense_dir = DATA_DIR_CONTAINER / project_name / "MVS_output" / mvs_type
         cmd += ["--dense_dir", str(dense_dir)]
+
+        # Dense-reconstruction tunables only reach the CLI when a dense step is
+        # actually requested -- a sparse-only run has no use for them, and
+        # keeping them off keeps the echoed command line readable in the log.
+        # Unset (None) fields produce no flag at all, so COLMAP's own default
+        # applies and an all-None model leaves the command byte-identical.
+        if mvs_params is not None:
+            cmd += mvs_params.cli_args()
 
     # reuse step: reuse the SfM undistort output (SFM_output/dense) so COLMAP MVS
     # skips a redundant image_undistorter pass and runs only patch_match + fusion.

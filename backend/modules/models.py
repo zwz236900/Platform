@@ -5,9 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +101,140 @@ class MVSConfig(BaseModel):
     gradient_step: float = Field(default=45.0)
     texture_resolution: int = Field(default=1, ge=1)
     export_type: str = Field(default="ply")
+
+
+# ---------------------------------------------------------------------------
+# COLMAP MVS tunables
+# ---------------------------------------------------------------------------
+
+#: Maps a ColmapMVSParams field to the CLI flag sfm_cli.py expects. The CLI then
+#: turns it into the COLMAP option -- e.g. "pms_window_radius" is passed to the
+#: CLI as --pms_window_radius and forwarded as --PatchMatchStereo.window_radius.
+#: Kept here as the single source of truth so the API layer, the stored config
+#: and the CLI cannot drift apart.
+COLMAP_MVS_CLI_FLAGS: dict[str, str] = {
+    # PatchMatch Stereo
+    "pms_max_image_size": "--pms_max_image_size",
+    "pms_window_radius": "--pms_window_radius",
+    "pms_window_step": "--pms_window_step",
+    "pms_num_samples": "--pms_num_samples",
+    "pms_num_iterations": "--pms_num_iterations",
+    "pms_cache_size": "--pms_cache_size",
+    "pms_geom_consistency_max_cost": "--pms_geom_consistency_max_cost",
+    "pms_filter": "--pms_filter",
+    "pms_filter_min_ncc": "--pms_filter_min_ncc",
+    "pms_filter_min_triangulation_angle": "--pms_filter_min_triangulation_angle",
+    "pms_filter_min_num_consistent": "--pms_filter_min_num_consistent",
+    "pms_filter_geom_consistency_max_cost": "--pms_filter_geom_consistency_max_cost",
+    # Stereo Fusion
+    "fusion_input_type": "--fusion_input_type",
+    "fusion_max_image_size": "--fusion_max_image_size",
+    "fusion_min_num_pixels": "--fusion_min_num_pixels",
+    "fusion_max_num_pixels": "--fusion_max_num_pixels",
+    "fusion_max_reproj_error": "--fusion_max_reproj_error",
+    "fusion_max_depth_error": "--fusion_max_depth_error",
+    "fusion_max_normal_error": "--fusion_max_normal_error",
+    "fusion_check_num_images": "--fusion_check_num_images",
+}
+
+
+class ColmapMVSParams(BaseModel):
+    """Tunables for the COLMAP dense-reconstruction stage.
+
+    Every field defaults to ``None``, meaning "don't pass the flag -- let COLMAP
+    use its own default". A run that sets nothing therefore behaves exactly like
+    the hardcoded pipeline did before these knobs existed.
+
+    Bounds mirror the ``Check()`` methods in COLMAP's own
+    ``mvs/patch_match_options.cc`` and ``mvs/fusion.cc`` so a bad value is
+    rejected here with a clear message instead of aborting inside COLMAP.
+
+    NOTE: this is deliberately NOT used as a FastAPI ``Form()`` model. Binding a
+    form model alongside the other scalar ``Form(...)`` parameters of
+    ``/mvs/run`` makes FastAPI embed the model as one nested field and silently
+    drop the flat fields the client sends. The endpoints take flat scalars and
+    build this model explicitly instead.
+    """
+
+    # ---- PatchMatch Stereo ----
+    pms_max_image_size: Optional[int] = Field(
+        default=None, ge=-1, description="Max image edge PatchMatch works on (-1 = no limit)")
+    pms_window_radius: Optional[int] = Field(
+        default=None, ge=1, le=32, description="Matching window radius (COLMAP max 32)")
+    pms_window_step: Optional[int] = Field(
+        default=None, ge=1, le=2, description="Window slide step (COLMAP allows 1 or 2)")
+    pms_num_samples: Optional[int] = Field(
+        default=None, ge=1, description="Number of depth samples per iteration")
+    pms_num_iterations: Optional[int] = Field(
+        default=None, ge=1, description="PatchMatch iterations")
+    pms_cache_size: Optional[int] = Field(
+        default=None, ge=1, description="Image/depth-map cache size in GB")
+    pms_geom_consistency_max_cost: Optional[float] = Field(
+        default=None, ge=0, description="Max cost for geometric consistency")
+    pms_filter: Optional[int] = Field(
+        default=None, ge=0, le=1, description="Enable depth-map filtering (1/0)")
+    pms_filter_min_ncc: Optional[float] = Field(
+        default=None, ge=-1, le=1, description="Min NCC to keep a pixel")
+    pms_filter_min_triangulation_angle: Optional[float] = Field(
+        default=None, ge=0, lt=180, description="Min triangulation angle in degrees")
+    pms_filter_min_num_consistent: Optional[int] = Field(
+        default=None, ge=0, description="Min number of consistent views")
+    pms_filter_geom_consistency_max_cost: Optional[float] = Field(
+        default=None, ge=0, description="Max cost for filtered geometric consistency")
+
+    # ---- Stereo Fusion ----
+    fusion_input_type: Optional[Literal["auto", "geometric", "photometric"]] = Field(
+        default=None,
+        description=(
+            "'auto' follows geom_consistency (geometric when on, photometric when "
+            "off); naming the wrong one fuses nothing."
+        ),
+    )
+    fusion_max_image_size: Optional[int] = Field(
+        default=None, ge=-1, description="Max image edge fusion works on (-1 = no limit)")
+    fusion_min_num_pixels: Optional[int] = Field(
+        default=None, ge=0, description="Min pixel observations for a 3D point")
+    fusion_max_num_pixels: Optional[int] = Field(
+        default=None, ge=1, description="Max pixel observations for a 3D point")
+    fusion_max_reproj_error: Optional[float] = Field(
+        default=None, ge=0, description="Max reprojection error in pixels")
+    fusion_max_depth_error: Optional[float] = Field(
+        default=None, ge=0, description="Max relative depth error")
+    fusion_max_normal_error: Optional[float] = Field(
+        default=None, ge=0, description="Max normal angle error in degrees")
+    fusion_check_num_images: Optional[int] = Field(
+        default=None, ge=1, description="Number of images checked during fusion")
+
+    @model_validator(mode="after")
+    def _check_pixel_bounds(self) -> "ColmapMVSParams":
+        """Mirror COLMAP's CHECK_OPTION_LE(min_num_pixels, max_num_pixels).
+
+        Only meaningful when both ends were given; leaving either unset means
+        COLMAP's default is in play, so there is nothing to compare.
+        """
+        lo, hi = self.fusion_min_num_pixels, self.fusion_max_num_pixels
+        if lo is not None and hi is not None and lo > hi:
+            raise ValueError(
+                f"fusion_min_num_pixels ({lo}) must be <= fusion_max_num_pixels ({hi})")
+        return self
+
+    def cli_args(self) -> list[str]:
+        """Render the set fields as CLI flags for sfm_cli.py.
+
+        Unset (None) fields are omitted entirely -- that omission is what makes
+        COLMAP fall back to its own default.
+        """
+        args: list[str] = []
+        for field, flag in COLMAP_MVS_CLI_FLAGS.items():
+            value = getattr(self, field)
+            if value is None:
+                continue
+            args += [flag, str(value)]
+        return args
+
+    def is_empty(self) -> bool:
+        """True when nothing was overridden (the pre-existing behaviour)."""
+        return all(getattr(self, f) is None for f in COLMAP_MVS_CLI_FLAGS)
 
 
 # ---------------------------------------------------------------------------
