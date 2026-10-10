@@ -36,6 +36,12 @@ from PySide6.QtGui import QFont
 from .base_page import BasePage
 from .projects import ApiClient
 from state import ProjectState, fill_project_combo
+from widgets.colmap_param_control import (
+    build_param_control,
+    collect_group_values,
+    set_param_value,
+)
+from widgets.sfm_advanced_dialog import sfm_param_label
 
 API_BASE = "http://localhost:8000"
 
@@ -212,31 +218,6 @@ def _format_size(n: int) -> str:
     if n >= 1 << 10:
         return f"{n / (1 << 10):.1f} KB"
     return f"{n} B"
-
-
-def _build_colmap_control(spec: dict):
-    """按 COLMAP_*_PARAMS 的 spec 造控件，初值即 COLMAP 自己的默认值。"""
-    if spec["kind"] == "choice":
-        combo = QComboBox()
-        for value, label in spec["choices"]:
-            combo.addItem(label, value)
-        idx = combo.findData(spec["default"])
-        if idx >= 0:
-            combo.setCurrentIndex(idx)
-        combo.setToolTip(spec["hint"])
-        return combo
-
-    if spec["kind"] == "float":
-        spin: QSpinBox | QDoubleSpinBox = QDoubleSpinBox()
-        spin.setDecimals(spec.get("decimals", 2))
-    else:
-        spin = QSpinBox()
-    spin.setRange(spec["lo"], spec["hi"])
-    spin.setSingleStep(spec["step"])
-    spin.setKeyboardTracking(False)  # 输入过程中不发 valueChanged
-    spin.setValue(spec["default"])
-    spin.setToolTip(spec["hint"])
-    return spin
 
 
 class MvsPage(BasePage):
@@ -446,7 +427,7 @@ class MvsPage(BasePage):
             form = QFormLayout(group)
             widgets = []
             for spec in specs:
-                w = _build_colmap_control(spec)
+                w = build_param_control(spec)
                 form.addRow(spec["label"] + ":", w)
                 self._colmap_widgets[spec["key"]] = w
                 widgets.append(w)
@@ -761,13 +742,7 @@ class MvsPage(BasePage):
         self._log_msg(f"  已应用预设「{name}」")
 
     def _set_colmap_value(self, key: str, value):
-        w = self._colmap_widgets[key]
-        if isinstance(w, QComboBox):
-            idx = w.findData(str(value))
-            if idx >= 0:
-                w.setCurrentIndex(idx)
-        else:
-            w.setValue(value)
+        set_param_value(self._colmap_widgets[key], value)
 
     def _collect_colmap_params(self) -> dict:
         """勾选了覆盖的分组才发送；没勾的组一个字段都不发 → COLMAP 用自己的默认值。"""
@@ -776,11 +751,39 @@ class MvsPage(BasePage):
                              ("fusion", COLMAP_FUSION_PARAMS)):
             if not self._colmap_groups[gname].isChecked():
                 continue
-            for spec in specs:
-                w = self._colmap_widgets[spec["key"]]
-                out[spec["key"]] = (w.currentData() if isinstance(w, QComboBox)
-                                    else str(w.value()))
+            out.update(collect_group_values(specs, self._colmap_widgets))
         return out
+
+    # ------------------------------------------------------------------
+    # SfM 工作区陈旧（409）
+    # ------------------------------------------------------------------
+
+    def _show_stale_workspace(self, body: dict):
+        """把 409 的结构化 detail 摊成人话：变了的参数 + 下一步怎么做。
+
+        后端刻意不提供「强制复用」后门——旧工作区里的稀疏模型与冻结的
+        stereo/patch-match.cfg 是用另一组参数产出的，复用只会得到看起来正常、
+        实际错配的点云。所以要给用户一条明确的出路（回 SfM 页重跑），
+        而不是一个能绕过检查的按钮。
+        """
+        changed = body.get("changed") or []
+        lines = [body.get("message", "SfM 工作区与当前参数不一致。")]
+        if changed:
+            lines += ["", "变化的参数："]
+            for item in changed:
+                lines.append(
+                    f"  • {sfm_param_label(str(item.get('name', '')))}："
+                    f"{self._fmt_param(item.get('produced'))} → {self._fmt_param(item.get('current'))}")
+        guidance = body.get("guidance")
+        if guidance:
+            lines += ["", str(guidance)]
+        self._status_label.setText("SfM 工作区已过期，需重建")
+        QMessageBox.warning(self, "SfM 工作区与当前参数不一致", "\n".join(lines))
+
+    @staticmethod
+    def _fmt_param(value) -> str:
+        """None = 该项没有覆盖，走 COLMAP 自己的默认值。"""
+        return "（用默认值）" if value is None else str(value)
 
     # ------------------------------------------------------------------
     # 运行
@@ -973,9 +976,16 @@ class MvsPage(BasePage):
         elif tag == "mvs_run":
             if error:
                 self._set_running(False)
-                self._log_msg(f"✗ 启动失败: {error}")
                 self._status_label.setText("启动失败")
-                QMessageBox.warning(self, "MVS 启动失败", str(error))
+                # 工作区陈旧（409）：把变化的参数列成人话，并说清下一步怎么做。
+                # 这条路径后端不会启动容器，所以这里只是提示，不是失败。
+                body = payload.get("_error_body")
+                if isinstance(body, dict) and body.get("code") == "sfm_workspace_stale":
+                    self._log_msg(f"⚠ SfM 工作区已过期，未启动 MVS：{body.get('message', '')}")
+                    self._show_stale_workspace(body)
+                else:
+                    self._log_msg(f"✗ 启动失败: {error}")
+                    QMessageBox.warning(self, "MVS 启动失败", str(error))
             else:
                 self._log_msg("✓ MVS 任务已启动，开始轮询日志...")
                 self._status_label.setText("MVS 运行中...")

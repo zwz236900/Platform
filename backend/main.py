@@ -32,6 +32,7 @@ from modules.logger import get_logger, request_log
 from modules.models import (
     CameraModel,
     ColmapMVSParams,
+    ColmapSFMParams,
     MatcherType,
     MVSCommand,
     MVSConfig,
@@ -39,6 +40,14 @@ from modules.models import (
     PipelineConfig,
     PipelineStep,
     TaskStatus,
+)
+from modules.sfm_fingerprint import (
+    SFM_FINGERPRINT_SCHEMA_VERSION,
+    build_stamp_json,
+    compute_sfm_fingerprint,
+    diff_sfm_params,
+    effective_sfm_config,
+    read_sfm_stamp,
 )
 from modules.mvs_runner import (
     build_mvs_command,
@@ -251,6 +260,15 @@ def _start_pipeline(project_name: str) -> None:
     config_dict = p.get("config", {})
     steps = config_dict.get("steps", ["extract", "match", "sfm", "undistort", "mvs"])
     mvs_params, _ = _stored_colmap_mvs(p)
+    sfm_params = _stored_colmap_sfm(p)
+
+    # Stamp the dense workspace with the SfM settings that produced it, so a
+    # later MVS-only run can tell whether reusing it is still valid. Offered
+    # unconditionally: build_sfm_command knows which step combinations actually
+    # produce the directory the MVS page reads, and drops the stamp otherwise.
+    sfm_stamp_json = build_stamp_json(
+        effective_sfm_config(config_dict, sfm_params)
+    )
 
     # Strip IPTC/EXIF metadata before pipeline to prevent OpenImageIO crash
     prep_result = strip_metadata(project_name)
@@ -273,6 +291,8 @@ def _start_pipeline(project_name: str) -> None:
         convert_output_suffix=config_dict.get("convert_output_suffix", "txt"),
         mvs_type=config_dict.get("mvs_type", "colmap"),
         mvs_params=mvs_params,
+        sfm_params=sfm_params,
+        sfm_stamp_json=sfm_stamp_json,
     )
 
     logger.info("Project %r starting pipeline: %s", project_name, " ".join(cmd))
@@ -776,6 +796,151 @@ def _stored_colmap_mvs(project: dict) -> tuple[ColmapMVSParams, bool]:
 
 
 # ---------------------------------------------------------------------------
+# COLMAP SfM tunables — request plumbing
+# ---------------------------------------------------------------------------
+
+#: Top-level project key holding the last SfM (sparse) settings. Separate from
+#: "config" for the same reason as COLMAP_MVS_PARAMS_KEY: update_project is a
+#: shallow update, so writing config=... replaces that whole dict.
+COLMAP_SFM_PARAMS_KEY = "colmap_sfm_params"
+
+#: Fingerprint of the settings most recently *requested*, for diagnostics only.
+#: The authority on whether a dense workspace may be reused is the stamp file
+#: inside that workspace -- this key cannot speak for what was actually produced
+#: if the run was interrupted or failed.
+SFM_FINGERPRINT_KEY = "sfm_fingerprint"
+
+
+async def colmap_sfm_form(
+    sift_max_image_size: Optional[int] = Form(default=None),
+    sift_first_octave: Optional[int] = Form(default=None),
+    sift_num_octaves: Optional[int] = Form(default=None),
+    sift_peak_threshold: Optional[float] = Form(default=None),
+    sift_edge_threshold: Optional[float] = Form(default=None),
+    match_max_ratio: Optional[float] = Form(default=None),
+    match_cross_check: Optional[int] = Form(default=None),
+    tv_max_error: Optional[float] = Form(default=None),
+    tv_min_num_inliers: Optional[int] = Form(default=None),
+    seq_overlap: Optional[int] = Form(default=None),
+    seq_loop_detection: Optional[int] = Form(default=None),
+    mapper_min_num_matches: Optional[int] = Form(default=None),
+    mapper_init_min_num_inliers: Optional[int] = Form(default=None),
+    mapper_abs_pose_min_num_inliers: Optional[int] = Form(default=None),
+    mapper_max_reg_trials: Optional[int] = Form(default=None),
+    mapper_ignore_two_view_tracks: Optional[int] = Form(default=None),
+    mapper_filter_max_reproj_error: Optional[float] = Form(default=None),
+    mapper_filter_min_tri_angle: Optional[float] = Form(default=None),
+    mapper_ba_refine_focal_length: Optional[int] = Form(default=None),
+    mapper_ba_refine_principal_point: Optional[int] = Form(default=None),
+    mapper_ba_refine_extra_params: Optional[int] = Form(default=None),
+    mapper_ba_local_num_images: Optional[int] = Form(default=None),
+    mapper_ba_local_max_num_iterations: Optional[int] = Form(default=None),
+    mapper_ba_global_max_num_iterations: Optional[int] = Form(default=None),
+) -> ColmapSFMParams:
+    """Gather the COLMAP sparse-reconstruction tunables from flat form fields.
+
+    Same trap as colmap_mvs_form, same fix: an ``Annotated[ColmapSFMParams,
+    Form()]`` model bound next to this endpoint's scalar Form parameters is
+    silently dropped, so every field is declared as its own scalar. The names
+    here match ColmapSFMParams field-for-field (and therefore the CLI flags,
+    minus the leading dashes), which keeps the three layers greppable.
+
+    Bounds live on the model so an out-of-range value returns a readable 400
+    naming the field, while a non-numeric one stays FastAPI's own 422. Every
+    field defaults to None = "let COLMAP decide".
+    """
+    try:
+        return ColmapSFMParams(
+            sift_max_image_size=sift_max_image_size,
+            sift_first_octave=sift_first_octave,
+            sift_num_octaves=sift_num_octaves,
+            sift_peak_threshold=sift_peak_threshold,
+            sift_edge_threshold=sift_edge_threshold,
+            match_max_ratio=match_max_ratio,
+            match_cross_check=match_cross_check,
+            tv_max_error=tv_max_error,
+            tv_min_num_inliers=tv_min_num_inliers,
+            seq_overlap=seq_overlap,
+            seq_loop_detection=seq_loop_detection,
+            mapper_min_num_matches=mapper_min_num_matches,
+            mapper_init_min_num_inliers=mapper_init_min_num_inliers,
+            mapper_abs_pose_min_num_inliers=mapper_abs_pose_min_num_inliers,
+            mapper_max_reg_trials=mapper_max_reg_trials,
+            mapper_ignore_two_view_tracks=mapper_ignore_two_view_tracks,
+            mapper_filter_max_reproj_error=mapper_filter_max_reproj_error,
+            mapper_filter_min_tri_angle=mapper_filter_min_tri_angle,
+            mapper_ba_refine_focal_length=mapper_ba_refine_focal_length,
+            mapper_ba_refine_principal_point=mapper_ba_refine_principal_point,
+            mapper_ba_refine_extra_params=mapper_ba_refine_extra_params,
+            mapper_ba_local_num_images=mapper_ba_local_num_images,
+            mapper_ba_local_max_num_iterations=mapper_ba_local_max_num_iterations,
+            mapper_ba_global_max_num_iterations=mapper_ba_global_max_num_iterations,
+        )
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        field = ".".join(str(part) for part in first["loc"])
+        msg = str(first["msg"]).removeprefix("Value error, ")
+        where = f"{field} — " if field else ""
+        raise HTTPException(400, f"COLMAP SfM 参数不合法：{where}{msg}")
+
+
+def _stored_colmap_sfm(project: dict) -> ColmapSFMParams:
+    """Rebuild the persisted COLMAP SfM settings.
+
+    Projects from before these knobs existed have no such key and get plain
+    defaults, which is also the all-None model that produces no CLI flags.
+    """
+    stored = dict(project.get(COLMAP_SFM_PARAMS_KEY) or {})
+    try:
+        return ColmapSFMParams(**stored)
+    except ValidationError:
+        # Only reachable via a hand-edited task.json. Defaults beat blocking the
+        # run, but the fingerprint will not match the stamp -- so a mismatched
+        # workspace still gets caught at the reuse check.
+        logger.warning("Ignoring unreadable %s: %r", COLMAP_SFM_PARAMS_KEY, stored)
+        return ColmapSFMParams()
+
+
+def _current_sfm_effective(project: dict) -> dict:
+    """The SfM settings a run started right now would apply.
+
+    Single source for both the stamp written by _start_pipeline and the
+    comparison made by the MVS reuse check, so the two can never disagree about
+    what "current" means.
+    """
+    return effective_sfm_config(
+        project.get("config", {}), _stored_colmap_sfm(project)
+    )
+
+
+#: Shown whenever a stale workspace is refused, so every entry point gives the
+#: user the same next step.
+_SFM_STALE_GUIDANCE = (
+    "请回到 SfM 页重跑一次重建（至少勾选 特征提取 / 特征匹配 / 稀疏重建 / 去畸变），"
+    "新工作区会记录当前参数指纹，之后即可继续 COLMAP MVS。"
+)
+
+
+def _sfm_stale_error(
+    message: str, changed: list[dict] | None = None
+) -> HTTPException:
+    """409 telling the client the dense workspace must not be reused.
+
+    Structured detail so the MVS page can list the parameters that changed
+    rather than showing one opaque sentence. There is deliberately no
+    force-reuse escape hatch: a mismatched workspace means MVS would consume a
+    sparse model and a patch-match.cfg built from different settings, which
+    yields a plausible-looking but wrong point cloud.
+    """
+    return HTTPException(409, {
+        "code": "sfm_workspace_stale",
+        "message": message,
+        "changed": changed or [],
+        "guidance": _SFM_STALE_GUIDANCE,
+    })
+
+
+# ---------------------------------------------------------------------------
 # API Routes — Pipeline
 # ---------------------------------------------------------------------------
 
@@ -794,6 +959,7 @@ async def run_pipeline(
     convert_output_suffix: str = Form(default="txt"),
     mvs_type: str = Form(default="colmap"),
     mvs_params: ColmapMVSParams = Depends(colmap_mvs_form),
+    sfm_params: ColmapSFMParams = Depends(colmap_sfm_form),
 ):
     """Configure and run the SfM pipeline for a project."""
     p = get_project(project_name)
@@ -832,15 +998,24 @@ async def run_pipeline(
     )
 
     # config is replaced wholesale here (that is this endpoint's contract), but
-    # the MVS tunables still go in their own key: resume reads them from there,
-    # and _start_pipeline resolves both keys the same way for every entry point.
+    # the MVS and SfM tunables still go in their own keys: resume reads the MVS
+    # ones from there, and _start_pipeline resolves all of them the same way for
+    # every entry point.
+    config_dump = config.model_dump()
     update_project(
         project_name,
-        config=config.model_dump(),
+        config=config_dump,
         **{COLMAP_MVS_PARAMS_KEY: {
             **mvs_params.model_dump(exclude_none=True),
             "no_geom_consistency": no_geom_consistency,
         }},
+        **{COLMAP_SFM_PARAMS_KEY: sfm_params.model_dump(exclude_none=True),
+           # Diagnostics only -- see SFM_FINGERPRINT_KEY.
+           SFM_FINGERPRINT_KEY: {
+               "schema_version": SFM_FINGERPRINT_SCHEMA_VERSION,
+               "fingerprint": compute_sfm_fingerprint(
+                   effective_sfm_config(config_dump, sfm_params)),
+           }},
     )
     logger.info("Project %r: config updated, starting pipeline", project_name)
     await asyncio.to_thread(_start_pipeline, project_name)
@@ -1591,9 +1766,35 @@ async def run_mvs_pipeline(
         # + 去畸变图像）。存在时 COLMAP MVS 复用该工作区（reuse 步骤只复制，跳过重复
         # image_undistorter），再跑 patch_match + fusion；不存在时回退 undistort + mvs。
         sfm_dense = _sfm_output_dir(project_name) / "dense"
-        can_reuse = (sfm_dense / "images").is_dir() and (sfm_dense / "sparse").is_dir()
-        steps = ["reuse", "mvs"] if can_reuse else ["undistort", "mvs"]
-        reuse_dense_dir = f"/data/{project_name}/SFM_output/dense" if can_reuse else None
+        has_dense = (sfm_dense / "images").is_dir() and (sfm_dense / "sparse").is_dir()
+
+        # "The directory exists" is not "it matches what would be built now".
+        # Reusing a workspace produced under different SfM settings silently
+        # copies a sparse model and a frozen stereo/patch-match.cfg into
+        # MVS_output, which produces a plausible but wrong point cloud, so
+        # refuse instead. Older projects have no stamp at all -- that is also a
+        # refusal, resolved by re-running the SfM stages once.
+        if has_dense:
+            stamp = read_sfm_stamp(sfm_dense)
+            current = _current_sfm_effective(p)
+            if stamp is None:
+                raise _sfm_stale_error(
+                    "SFM_output/dense 里没有 SfM 参数指纹，无法确认它与当前参数一致"
+                    "（本项目是在参数可调功能上线前重建的）。")
+            if stamp.get("schema_version") != SFM_FINGERPRINT_SCHEMA_VERSION:
+                raise _sfm_stale_error(
+                    "SFM_output/dense 的参数指纹版本已过期"
+                    f"（记录为 {stamp.get('schema_version')!r}，"
+                    f"当前为 {SFM_FINGERPRINT_SCHEMA_VERSION}）。")
+            if stamp.get("fingerprint") != compute_sfm_fingerprint(current):
+                changed = diff_sfm_params(stamp.get("params") or {}, current)
+                names = "、".join(str(c["name"]) for c in changed) or "（无法定位具体项）"
+                raise _sfm_stale_error(
+                    f"SFM_output/dense 是用另一组 SfM 参数产出的，已改为：{names}。",
+                    changed=changed)
+
+        steps = ["reuse", "mvs"] if has_dense else ["undistort", "mvs"]
+        reuse_dense_dir = f"/data/{project_name}/SFM_output/dense" if has_dense else None
 
         # 几何一致性关掉时只有 .photometric.bin，fusion 读 geometric 会产出空点云。
         # CLI 也会挡（同样报错退出），这里提前拦下给出可读的 400。
@@ -1610,6 +1811,11 @@ async def run_mvs_pipeline(
             gpu_index=0,
             no_geom_consistency=no_geom_consistency,
             mvs_type="colmap",
+            # reconstruction_name used to be omitted here, so the CLI fell back
+            # to "0" and the fallback undistort path below silently picked the
+            # wrong sparse model on a project with more than one. Unused by the
+            # reuse path, but it must be right on the path that reads it.
+            reconstruction_name=p.get("config", {}).get("reconstruction_name", "0"),
             reuse_dense_dir=reuse_dense_dir,
             mvs_params=mvs_params,
         )

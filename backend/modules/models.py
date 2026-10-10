@@ -238,6 +238,154 @@ class ColmapMVSParams(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# COLMAP SfM (sparse) tunables
+# ---------------------------------------------------------------------------
+
+#: Maps a ColmapSFMParams field to the CLI flag sfm_cli.py expects. The CLI then
+#: forwards it as the COLMAP option named in SfM_PARAM_GROUPS there -- e.g.
+#: "mapper_filter_min_tri_angle" becomes --Mapper.filter_min_tri_angle.
+#:
+#: Names and bounds were taken from the real binary (`colmap <cmd> -h`,
+#: COLMAP 4.2.0.dev0), not from documentation: 4.2 has no
+#: Mapper.triangulation.* and no Mapper.ba_refine_extrinsics, and the max image
+#: size lives under FeatureExtraction while the rest of the SIFT knobs live
+#: under SiftExtraction.
+#:
+#: Kept here as the single source of truth so the API layer, the stored config
+#: and the CLI cannot drift apart.
+COLMAP_SFM_CLI_FLAGS: dict[str, str] = {
+    # Feature extraction
+    "sift_max_image_size": "--sift_max_image_size",
+    "sift_first_octave": "--sift_first_octave",
+    "sift_num_octaves": "--sift_num_octaves",
+    "sift_peak_threshold": "--sift_peak_threshold",
+    "sift_edge_threshold": "--sift_edge_threshold",
+    # Feature matching
+    "match_max_ratio": "--match_max_ratio",
+    "match_cross_check": "--match_cross_check",
+    # Two-view geometry
+    "tv_max_error": "--tv_max_error",
+    "tv_min_num_inliers": "--tv_min_num_inliers",
+    # Sequential matching
+    "seq_overlap": "--seq_overlap",
+    "seq_loop_detection": "--seq_loop_detection",
+    # Mapper registration / triangulation
+    "mapper_min_num_matches": "--mapper_min_num_matches",
+    "mapper_init_min_num_inliers": "--mapper_init_min_num_inliers",
+    "mapper_abs_pose_min_num_inliers": "--mapper_abs_pose_min_num_inliers",
+    "mapper_max_reg_trials": "--mapper_max_reg_trials",
+    "mapper_ignore_two_view_tracks": "--mapper_ignore_two_view_tracks",
+    "mapper_filter_max_reproj_error": "--mapper_filter_max_reproj_error",
+    "mapper_filter_min_tri_angle": "--mapper_filter_min_tri_angle",
+    # Mapper bundle adjustment
+    "mapper_ba_refine_focal_length": "--mapper_ba_refine_focal_length",
+    "mapper_ba_refine_principal_point": "--mapper_ba_refine_principal_point",
+    "mapper_ba_refine_extra_params": "--mapper_ba_refine_extra_params",
+    "mapper_ba_local_num_images": "--mapper_ba_local_num_images",
+    "mapper_ba_local_max_num_iterations": "--mapper_ba_local_max_num_iterations",
+    "mapper_ba_global_max_num_iterations": "--mapper_ba_global_max_num_iterations",
+}
+
+
+class ColmapSFMParams(BaseModel):
+    """Tunables for the COLMAP sparse-reconstruction stage.
+
+    Every field defaults to ``None``, meaning "don't pass the flag -- let COLMAP
+    use its own default". A run that sets nothing therefore behaves exactly like
+    the hardcoded pipeline did before these knobs existed.
+
+    Bounds mirror the ``-h`` output of the COLMAP 4.2.0.dev0 binary this platform
+    ships. Unlike the MVS options there is no cross-option ``CHECK_OPTION`` to
+    mirror here, so there is no model validator.
+
+    NOTE: like ``ColmapMVSParams`` this is deliberately NOT used as a FastAPI
+    ``Form()`` model. Binding a form model alongside the scalar ``Form(...)``
+    parameters of the endpoints makes FastAPI embed it as one nested field and
+    silently drop the flat fields the client sends. The endpoints take flat
+    scalars and build this model explicitly instead.
+    """
+
+    # ---- Feature extraction ----
+    sift_max_image_size: Optional[int] = Field(
+        default=None, ge=-1, description="特征提取前图像最大边长（-1 = 不限制）")
+    sift_first_octave: Optional[int] = Field(
+        default=None, ge=-1, description="SIFT 起始金字塔层（-1 = 先上采样）")
+    sift_num_octaves: Optional[int] = Field(
+        default=None, ge=1, description="SIFT 高斯金字塔组数")
+    sift_peak_threshold: Optional[float] = Field(
+        default=None, ge=0, description="特征点检测峰值阈值（越小特征越密）")
+    sift_edge_threshold: Optional[float] = Field(
+        default=None, ge=0, description="SIFT 边缘响应阈值")
+
+    # ---- Feature matching ----
+    match_max_ratio: Optional[float] = Field(
+        default=None, ge=0, le=1, description="最近邻/次近邻距离比（越小越严格）")
+    match_cross_check: Optional[int] = Field(
+        default=None, ge=0, le=1, description="双向交叉验证（1/0）")
+
+    # ---- Two-view geometry ----
+    tv_max_error: Optional[float] = Field(
+        default=None, ge=0, description="RANSAC 最大重投影误差，像素")
+    tv_min_num_inliers: Optional[int] = Field(
+        default=None, ge=0, description="图像对有效所需最小内点数")
+
+    # ---- Sequential matching (only used by --matcher sequential) ----
+    seq_overlap: Optional[int] = Field(
+        default=None, ge=0, description="每张图匹配的相邻图像数")
+    seq_loop_detection: Optional[int] = Field(
+        default=None, ge=0, le=1, description="回环检测（1/0）")
+
+    # ---- Mapper registration / triangulation ----
+    mapper_min_num_matches: Optional[int] = Field(
+        default=None, ge=0, description="图像对进入重建所需最小匹配数")
+    mapper_init_min_num_inliers: Optional[int] = Field(
+        default=None, ge=0, description="初始化两视图所需最小内点数")
+    mapper_abs_pose_min_num_inliers: Optional[int] = Field(
+        default=None, ge=0, description="新图像注册（PnP）最小内点数")
+    mapper_max_reg_trials: Optional[int] = Field(
+        default=None, ge=0, description="单张图像最大注册尝试次数")
+    mapper_ignore_two_view_tracks: Optional[int] = Field(
+        default=None, ge=0, le=1,
+        description="忽略仅两视图可见的 3D 点（1/0；关掉可增密但引入噪声）")
+    mapper_filter_max_reproj_error: Optional[float] = Field(
+        default=None, ge=0, description="三角化最大重投影误差，像素")
+    mapper_filter_min_tri_angle: Optional[float] = Field(
+        default=None, ge=0, lt=90, description="最小三角化角，度")
+
+    # ---- Mapper bundle adjustment ----
+    mapper_ba_refine_focal_length: Optional[int] = Field(
+        default=None, ge=0, le=1, description="精修焦距（1/0）")
+    mapper_ba_refine_principal_point: Optional[int] = Field(
+        default=None, ge=0, le=1, description="精修主点（1/0；少图场景易发散）")
+    mapper_ba_refine_extra_params: Optional[int] = Field(
+        default=None, ge=0, le=1, description="精修畸变参数（1/0）")
+    mapper_ba_local_num_images: Optional[int] = Field(
+        default=None, ge=1, description="局部 BA 使用的邻近图像数")
+    mapper_ba_local_max_num_iterations: Optional[int] = Field(
+        default=None, ge=-1, description="局部 BA 最大迭代数（-1 = 自动）")
+    mapper_ba_global_max_num_iterations: Optional[int] = Field(
+        default=None, ge=-1, description="全局 BA 最大迭代数（-1 = 自动）")
+
+    def cli_args(self) -> list[str]:
+        """Render the set fields as CLI flags for sfm_cli.py.
+
+        Unset (None) fields are omitted entirely -- that omission is what makes
+        COLMAP fall back to its own default.
+        """
+        args: list[str] = []
+        for field, flag in COLMAP_SFM_CLI_FLAGS.items():
+            value = getattr(self, field)
+            if value is None:
+                continue
+            args += [flag, str(value)]
+        return args
+
+    def is_empty(self) -> bool:
+        """True when nothing was overridden (the pre-existing behaviour)."""
+        return all(getattr(self, f) is None for f in COLMAP_SFM_CLI_FLAGS)
+
+
+# ---------------------------------------------------------------------------
 # Response models
 # ---------------------------------------------------------------------------
 

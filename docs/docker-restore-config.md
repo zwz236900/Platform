@@ -105,10 +105,20 @@ docker run -d --name colmap-dev --gpus all --shm-size=8g \
 > /home/zwz/Code/Platform/work/colmap_cli/sync_to_container.sh
 > ```
 >
-> 原因：`/colmap/sfm_cli.py`（MVS 超参数 CLI）是**烘焙进镜像**的，宿主上改的那份
-> 容器读不到；MVS 页面暴露的 20 个 COLMAP 稠密重建参数全部经由它透传。恢复镜像或
-> 重建容器后会退回**旧版脚本**，前端参数将全部被静默忽略。
-> 回写脚本会 `docker cp` 并做 `py_compile` 校验。
+> 原因：`/colmap/sfm_cli.py`（COLMAP 超参数 CLI）是**烘焙进镜像**的，宿主上改的那份
+> 容器读不到；前端暴露的 COLMAP 参数全部经由它透传，共两组：
+>
+> - MVS 页的 **20 个稠密重建参数**（PatchMatch / 深度融合）；
+> - SfM 页「⚙ 高级参数…」对话框的 **24 个稀疏重建参数**（特征提取 / 匹配与两视图几何 /
+>   顺序匹配 / Mapper / 束调整）。
+>
+> 恢复镜像或重建容器后会退回**旧版脚本**。旧版脚本没有这些 `--sift_*` / `--match_*` /
+> `--mapper_*` / `--sfm_stamp_json` 选项，**argparse 会直接非零退出**——不是静默忽略，
+> 而是 SfM 页每一次运行都失败。同时因为拿不到 `--sfm_stamp_json`，
+> `SFM_output/dense` 里不会写参数指纹，MVS 页的存量校验也会一并拦住。
+> 回写脚本会 `docker cp` 并做 `py_compile` 校验；回写后可用
+> `docker exec colmap-dev python3 /colmap/sfm_cli.py --help | grep sfm_stamp_json`
+> 确认容器内已是新版。
 > 彻底办法（需重建容器时加）：给这一个文件挂载
 > `-v /home/zwz/Code/Platform/work/colmap_cli/sfm_cli.py:/colmap/sfm_cli.py`；
 > **不要**整目录挂载 `/colmap`——那会遮住镜像里约 6.7GB 的 COLMAP 源码与构建树。

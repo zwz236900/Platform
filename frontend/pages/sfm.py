@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QComboBox,
     QCheckBox,
+    QDialog,
     QSpinBox,
     QGroupBox,
     QFormLayout,
@@ -26,6 +27,7 @@ from PySide6.QtGui import QFont
 from .base_page import BasePage
 from .projects import ApiClient
 from state import ProjectState, fill_project_combo
+from widgets.sfm_advanced_dialog import SfmAdvancedDialog, count_overrides
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -138,6 +140,24 @@ class SfMPage(BasePage):
 
         self.content_layout.addLayout(params)
 
+        # ── 高级参数：24 个 COLMAP 稀疏重建超参数收进独立对话框，主页保持简洁 ──
+        self._sfm_params: dict[str, str] = {}   # 只在对话框中勾选覆盖的字段
+        adv_row = QHBoxLayout()
+        self.adv_btn = QPushButton("⚙ 高级参数…")
+        self.adv_btn.setObjectName("actionBtn")
+        self.adv_btn.setToolTip(
+            "调整 COLMAP 稀疏重建的提取 / 匹配 / Mapper / BA 超参数。\n"
+            "不打开此对话框时全部使用 COLMAP 默认值。")
+        self.adv_btn.clicked.connect(self._on_advanced)
+        adv_row.addWidget(self.adv_btn)
+
+        self._adv_summary = QLabel("")
+        self._adv_summary.setStyleSheet("color:#8b949e; font-size:13px;")
+        adv_row.addWidget(self._adv_summary)
+        adv_row.addStretch()
+        self.content_layout.addLayout(adv_row)
+        self._refresh_adv_summary()
+
         # ── 操作按钮 ──
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -231,6 +251,26 @@ class SfMPage(BasePage):
             self.project_combo.setCurrentIndex(-1)
 
     # ------------------------------------------------------------------
+    # 高级参数
+    # ------------------------------------------------------------------
+
+    def _on_advanced(self):
+        """打开模态对话框编辑 SfM 超参数；确定后只保存勾选覆盖的字段。"""
+        dlg = SfmAdvancedDialog(self, current=self._sfm_params)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self._sfm_params = dlg.result_params()
+        self._refresh_adv_summary()
+        n = count_overrides(self._sfm_params)
+        self._log_msg(f"  高级参数：覆盖 {n} 项" if n
+                      else "  高级参数：全部使用 COLMAP 默认值")
+
+    def _refresh_adv_summary(self):
+        n = count_overrides(self._sfm_params)
+        self._adv_summary.setText(
+            "SfM 参数：默认（COLMAP 内置值）" if n == 0 else f"SfM 参数：已覆盖 {n} 项")
+
+    # ------------------------------------------------------------------
     # 启动 Pipeline
     # ------------------------------------------------------------------
 
@@ -256,6 +296,9 @@ class SfMPage(BasePage):
             "max_num_features": str(self.features_spin.value()),
             "no_geom_consistency": str(self.geo_check.isChecked()).lower(),
         }
+        # 高级参数：只叠加在对话框里勾选过覆盖的字段（未勾选的键根本不在这里，
+        # 后端据此保持 None → CLI 不追加 flag → COLMAP 用默认值）。
+        config.update(self._sfm_params)
 
         self._current_project = project
         self._set_running(True)

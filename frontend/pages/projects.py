@@ -193,7 +193,12 @@ class ApiClient(QWidget):
                     err_msg = err_obj.get("detail", err_text)
                 except Exception:
                     err_msg = err_text or reply.errorString()
-                self.finished.emit(method, path, {"_error": err_msg, "_tag": tag})
+                # detail 是结构化对象时（如 409 的 sfm_workspace_stale）额外原样带上，
+                # 调用方能读到 changed/guidance 等字段，而不必去 parse 那句话。
+                err_body = err_msg if isinstance(err_msg, dict) else None
+                self.finished.emit(method, path, {"_error": err_msg,
+                                                  "_error_body": err_body,
+                                                  "_tag": tag})
             else:
                 data = bytes(reply.readAll()).decode("utf-8", errors="replace")
                 try:

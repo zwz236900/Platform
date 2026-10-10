@@ -71,6 +71,13 @@ MATCHER_CHOICES = ["exhaustive", "sequential", "vocab_tree", "spatial"]
 # Full pipeline (default)
 FULL_PIPELINE = ["extract", "match", "sfm", "undistort", "mvs"]
 
+# Name of the SfM parameter stamp written into the dense workspace. The backend
+# owns the contents (it hands them over as an opaque JSON blob via
+# --sfm_stamp_json); this script only puts the file next to the artifacts it
+# describes, so the backend can tell whether the workspace matches the SfM
+# settings currently in effect.
+SFM_STAMP_FILENAME = ".sfm_stamp.json"
+
 # ---------------------------------------------------------------------------
 # MVS tunables
 # ---------------------------------------------------------------------------
@@ -108,6 +115,103 @@ FUSION_PARAMS: dict[str, tuple[type, str]] = {
 }
 
 FUSION_INPUT_TYPES = ["auto", "geometric", "photometric"]
+
+
+# ---------------------------------------------------------------------------
+# SfM tunables
+# ---------------------------------------------------------------------------
+#
+# Same contract as the MVS tunables above: registered with default=None and
+# append_opt() drops whatever the caller did not set, so COLMAP's own default
+# applies and a caller that passes nothing is byte-identical to before.
+#
+# Names and defaults below were read off the real binary (`colmap <cmd> -h`,
+# COLMAP 4.2.0.dev0) rather than from published tables, several of which are
+# stale for 4.2: there is no Mapper.triangulation.* and no
+# Mapper.ba_refine_extrinsics here -- the equivalents are Mapper.filter_* and
+# Mapper.tri_*.
+#
+# Each entry is (type, COLMAP option, help). The COLMAP option is spelled out
+# in full because these groups do NOT share a namespace: the max image size
+# lives under FeatureExtraction while the other SIFT knobs live under
+# SiftExtraction, and TwoViewGeometry is a namespace of its own.
+
+SIFT_EXTRACTION_PARAMS: dict[str, tuple[type, str, str]] = {
+    "max_image_size": (int, "FeatureExtraction.max_image_size",
+                       "提取前图像最大边长（默认 -1 = 不限制）"),
+    "first_octave": (int, "SiftExtraction.first_octave",
+                     "起始金字塔层（默认 -1 = 先上采样再提取）"),
+    "num_octaves": (int, "SiftExtraction.num_octaves",
+                    "高斯金字塔组数（默认 4）"),
+    "peak_threshold": (float, "SiftExtraction.peak_threshold",
+                       "特征点检测峰值阈值（默认 0.00667；越小特征越密）"),
+    "edge_threshold": (float, "SiftExtraction.edge_threshold",
+                       "边缘响应阈值（默认 10）"),
+}
+
+SIFT_MATCHING_PARAMS: dict[str, tuple[type, str, str]] = {
+    "max_ratio": (float, "SiftMatching.max_ratio",
+                  "最近邻/次近邻距离比（默认 0.8；越小越严格）"),
+    "cross_check": (int, "SiftMatching.cross_check",
+                    "双向交叉验证 0/1（默认 1）"),
+}
+
+TWO_VIEW_GEOMETRY_PARAMS: dict[str, tuple[type, str, str]] = {
+    "max_error": (float, "TwoViewGeometry.max_error",
+                  "RANSAC 最大重投影误差，像素（默认 4）"),
+    "min_num_inliers": (int, "TwoViewGeometry.min_num_inliers",
+                        "图像对有效所需最小内点数（默认 15）"),
+}
+
+SEQUENTIAL_MATCHING_PARAMS: dict[str, tuple[type, str, str]] = {
+    "overlap": (int, "SequentialMatching.overlap",
+                "每张图匹配的相邻图像数（默认 10；仅 sequential 匹配生效）"),
+    "loop_detection": (int, "SequentialMatching.loop_detection",
+                       "回环检测 0/1（默认 0；仅 sequential 匹配生效）"),
+}
+
+MAPPER_PARAMS: dict[str, tuple[type, str, str]] = {
+    "min_num_matches": (int, "Mapper.min_num_matches",
+                        "图像对进入重建所需最小匹配数（默认 15）"),
+    "init_min_num_inliers": (int, "Mapper.init_min_num_inliers",
+                             "初始化两视图所需最小内点数（默认 100）"),
+    "abs_pose_min_num_inliers": (int, "Mapper.abs_pose_min_num_inliers",
+                                 "新图像注册（PnP）最小内点数（默认 30）"),
+    "max_reg_trials": (int, "Mapper.max_reg_trials",
+                       "单张图像最大注册尝试次数（默认 3）"),
+    "ignore_two_view_tracks": (int, "Mapper.tri_ignore_two_view_tracks",
+                               "忽略仅两视图可见的 3D 点 0/1（默认 1）"),
+    "filter_max_reproj_error": (float, "Mapper.filter_max_reproj_error",
+                                "三角化最大重投影误差，像素（默认 4）"),
+    "filter_min_tri_angle": (float, "Mapper.filter_min_tri_angle",
+                             "最小三角化角，度（默认 1.5）"),
+}
+
+MAPPER_BA_PARAMS: dict[str, tuple[type, str, str]] = {
+    "refine_focal_length": (int, "Mapper.ba_refine_focal_length",
+                            "精修焦距 0/1（默认 1）"),
+    "refine_principal_point": (int, "Mapper.ba_refine_principal_point",
+                               "精修主点 0/1（默认 0；少图场景易发散）"),
+    "refine_extra_params": (int, "Mapper.ba_refine_extra_params",
+                            "精修畸变参数 0/1（默认 1）"),
+    "local_num_images": (int, "Mapper.ba_local_num_images",
+                         "局部 BA 使用的邻近图像数（默认 6）"),
+    "local_max_num_iterations": (int, "Mapper.ba_local_max_num_iterations",
+                                 "局部 BA 最大迭代数（默认 -1 = 自动）"),
+    "global_max_num_iterations": (int, "Mapper.ba_global_max_num_iterations",
+                                  "全局 BA 最大迭代数（默认 -1 = 自动）"),
+}
+
+# (CLI prefix, argparse group title, options). One place ties a CLI flag name
+# to its COLMAP namespace, so the two can never be spelled differently.
+SFM_PARAM_GROUPS: list[tuple[str, str, dict[str, tuple[type, str, str]]]] = [
+    ("sift", "SfM / 特征提取 (SiftExtraction)", SIFT_EXTRACTION_PARAMS),
+    ("match", "SfM / 特征匹配 (SiftMatching)", SIFT_MATCHING_PARAMS),
+    ("tv", "SfM / 两视图几何 (TwoViewGeometry)", TWO_VIEW_GEOMETRY_PARAMS),
+    ("seq", "SfM / 顺序匹配 (SequentialMatching)", SEQUENTIAL_MATCHING_PARAMS),
+    ("mapper", "SfM / Mapper 注册与三角化", MAPPER_PARAMS),
+    ("mapper_ba", "SfM / Mapper 束调整 (BA)", MAPPER_BA_PARAMS),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +281,33 @@ def collect_mvs_opts(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str
     patch_match_opts = {name: getattr(args, f"pms_{name}") for name in PATCH_MATCH_PARAMS}
     fusion_opts = {name: getattr(args, f"fusion_{name}") for name in FUSION_PARAMS}
     return patch_match_opts, fusion_opts
+
+
+def collect_sfm_opts(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
+    """Pull the --sift_* / --match_* / --tv_* / --seq_* / --mapper_* tunables.
+
+    Returns one dict per group, keyed by the group prefix. None entries are
+    kept, same reasoning as collect_mvs_opts: append_opt() drops them, which is
+    the "COLMAP default" behaviour for anything the caller didn't set.
+    """
+    return {
+        prefix: {name: getattr(args, f"{prefix}_{name}") for name in group}
+        for prefix, _title, group in SFM_PARAM_GROUPS
+    }
+
+
+def append_group_opts(
+    cmd: list[str],
+    group: dict[str, tuple[type, str, str]],
+    values: dict[str, Any],
+) -> None:
+    """Append every set option of one SfM group, spelled as its COLMAP flag.
+
+    The COLMAP option name lives only in the group dicts, so a step never has
+    to hardcode (or guess) the namespace a knob belongs to.
+    """
+    for name, (_typ, colmap_opt, _help) in group.items():
+        append_opt(cmd, f"--{colmap_opt}", values.get(name))
 
 
 def run_colmap(
@@ -251,6 +382,7 @@ def step_extract(
     use_gpu: bool = True,
     gpu_index: int = 0,
     max_num_features: int = 0,
+    sift_opts: dict[str, Any] | None = None,
     log_file: Path | None = None,
 ) -> dict[str, Any]:
     """Run COLMAP feature_extractor."""
@@ -271,6 +403,7 @@ def step_extract(
     # max_num_features=0 is invalid in COLMAP 4.2+; omit to use default (8192)
     if max_num_features > 0:
         cmd += ["--SiftExtraction.max_num_features", str(max_num_features)]
+    append_group_opts(cmd, SIFT_EXTRACTION_PARAMS, sift_opts or {})
 
     run_colmap(cmd, log_file=log_file)
 
@@ -284,6 +417,9 @@ def step_match(
     use_gpu: bool = True,
     gpu_index: int = 0,
     vocab_tree_path: str | None = None,
+    match_opts: dict[str, Any] | None = None,
+    tv_opts: dict[str, Any] | None = None,
+    seq_opts: dict[str, Any] | None = None,
     log_file: Path | None = None,
 ) -> dict[str, Any]:
     """Run COLMAP feature matching."""
@@ -291,38 +427,34 @@ def step_match(
     print(f"Step 2/5: Feature Matching  (matcher={matcher})")
     print(f"{'='*60}")
 
-    if matcher == "exhaustive":
-        run_colmap([
-            "exhaustive_matcher",
-            "--database_path", str(database_path),
-            "--FeatureMatching.use_gpu", "1" if use_gpu else "0",
-            "--FeatureMatching.gpu_index", str(gpu_index),
-        ], log_file=log_file)
-    elif matcher == "sequential":
-        run_colmap([
-            "sequential_matcher",
-            "--database_path", str(database_path),
-            "--FeatureMatching.use_gpu", "1" if use_gpu else "0",
-            "--FeatureMatching.gpu_index", str(gpu_index),
-        ], log_file=log_file)
-    elif matcher == "vocab_tree":
-        vtree = vocab_tree_path or ""
-        run_colmap([
-            "vocab_tree_matcher",
-            "--database_path", str(database_path),
-            "--VocabTreeMatching.vocab_tree_path", vtree,
-            "--FeatureMatching.use_gpu", "1" if use_gpu else "0",
-            "--FeatureMatching.gpu_index", str(gpu_index),
-        ], log_file=log_file)
-    elif matcher == "spatial":
-        run_colmap([
-            "spatial_matcher",
-            "--database_path", str(database_path),
-            "--FeatureMatching.use_gpu", "1" if use_gpu else "0",
-            "--FeatureMatching.gpu_index", str(gpu_index),
-        ], log_file=log_file)
-    else:
+    subcommand = {
+        "exhaustive": "exhaustive_matcher",
+        "sequential": "sequential_matcher",
+        "vocab_tree": "vocab_tree_matcher",
+        "spatial": "spatial_matcher",
+    }.get(matcher)
+    if subcommand is None:
         raise ValueError(f"Unknown matcher: {matcher}")
+
+    # Flag order matters here only in that it must stay byte-identical to the
+    # pre-tunable command line; the vocab tree path sits between the database
+    # path and the GPU flags, as it always has.
+    cmd = [subcommand, "--database_path", str(database_path)]
+    if matcher == "vocab_tree":
+        cmd += ["--VocabTreeMatching.vocab_tree_path", vocab_tree_path or ""]
+    cmd += [
+        "--FeatureMatching.use_gpu", "1" if use_gpu else "0",
+        "--FeatureMatching.gpu_index", str(gpu_index),
+    ]
+
+    # The matching / two-view knobs apply to every matcher; the sequential ones
+    # only ever reach sequential_matcher (no other subcommand knows them).
+    append_group_opts(cmd, SIFT_MATCHING_PARAMS, match_opts or {})
+    append_group_opts(cmd, TWO_VIEW_GEOMETRY_PARAMS, tv_opts or {})
+    if matcher == "sequential":
+        append_group_opts(cmd, SEQUENTIAL_MATCHING_PARAMS, seq_opts or {})
+
+    run_colmap(cmd, log_file=log_file)
 
     return {"matcher": matcher, "status": "ok"}
 
@@ -332,6 +464,8 @@ def step_sfm(
     image_dir: Path,
     sparse_dir: Path,
     *,
+    mapper_opts: dict[str, Any] | None = None,
+    mapper_ba_opts: dict[str, Any] | None = None,
     log_file: Path | None = None,
 ) -> dict[str, Any]:
     """Run COLMAP mapper (sparse reconstruction)."""
@@ -341,12 +475,16 @@ def step_sfm(
 
     sparse_dir.mkdir(parents=True, exist_ok=True)
 
-    run_colmap([
+    cmd = [
         "mapper",
         "--database_path", str(database_path),
         "--image_path", str(image_dir),
         "--output_path", str(sparse_dir),
-    ], log_file=log_file)
+    ]
+    append_group_opts(cmd, MAPPER_PARAMS, mapper_opts or {})
+    append_group_opts(cmd, MAPPER_BA_PARAMS, mapper_ba_opts or {})
+
+    run_colmap(cmd, log_file=log_file)
 
     # Count reconstructions
     rec_dirs = sorted([d for d in sparse_dir.iterdir() if d.is_dir()])
@@ -373,6 +511,7 @@ def step_undistort(
     reconstruction_name: str = "0",
     max_image_size: int | None = None,
     num_patch_match_src_images: int | None = None,
+    sfm_stamp_json: str | None = None,
     log_file: Path | None = None,
 ) -> dict[str, Any]:
     """Run COLMAP image_undistorter to prepare for MVS.
@@ -382,6 +521,14 @@ def step_undistort(
     regenerated by the mvs step, so changing it only has an effect when the
     undistort step actually runs (the reuse step just copies an existing
     workspace, frozen cfg included).
+
+    ``sfm_stamp_json`` is an opaque blob supplied by the backend describing the
+    SfM settings this workspace is being built with. It is written verbatim to
+    ``<dense_dir>/.sfm_stamp.json`` -- but only on success, and any previous
+    stamp is removed first. Because the backend always passes ``--no_clean``, a
+    stale stamp would otherwise survive an interrupted re-run and describe a
+    half-overwritten directory; invalidating up front means an interrupted run
+    leaves *no* stamp (honest) rather than a wrong one.
     """
     print(f"\n{'='*60}")
     print("Step 4/5: Image Undistortion")
@@ -394,6 +541,14 @@ def step_undistort(
         return {"status": "skipped", "reason": f"sparse model not found: {input_path}"}
 
     dense_dir.mkdir(parents=True, exist_ok=True)
+
+    # Invalidate any stamp from an earlier run BEFORE touching the workspace, so
+    # an interrupted run cannot leave a stamp claiming settings it never
+    # finished applying.
+    stamp_path = dense_dir / SFM_STAMP_FILENAME
+    if stamp_path.exists():
+        stamp_path.unlink()
+        print(f"  Removed previous SfM stamp: {stamp_path.name}")
 
     cmd = [
         "image_undistorter",
@@ -422,6 +577,18 @@ def step_undistort(
         shutil.rmtree(sparse_dir_dense)
         txt_tmp.rename(sparse_dir_dense)
         print(f"  Converted dense/sparse to TXT for OpenMVS compatibility")
+
+    # Stamp last, once the undistorter AND the TXT conversion have both
+    # succeeded. The backend reads this to decide whether the workspace may be
+    # reused by a later MVS-only run, so writing it early (or after a failure)
+    # would be worse than not writing it at all.
+    if sfm_stamp_json:
+        stamp = json.loads(sfm_stamp_json)
+        stamp["created_at"] = datetime.now(timezone.utc).isoformat()
+        with open(stamp_path, "w", encoding="utf-8") as f:
+            json.dump(stamp, f, indent=2, ensure_ascii=False)
+        print(f"  Wrote SfM parameter stamp: {stamp_path.name} "
+              f"(fingerprint {str(stamp.get('fingerprint'))[:12]})")
 
     return {"input_reconstruction": reconstruction_name, "status": "ok"}
 
@@ -665,6 +832,22 @@ def build_pipeline_result(
         "num_patch_match_src_images": args.num_patch_match_src_images,
         "patch_match": {k: v for k, v in patch_match_opts.items() if v is not None},
         "fusion": {k: v for k, v in fusion_opts.items() if v is not None},
+    }
+
+    # Same idea for the sparse stage. Only explicitly set tunables are listed;
+    # anything absent means "COLMAP's own default".
+    sfm_opts = collect_sfm_opts(args)
+    result["sfm"] = {
+        "camera_model": args.camera_model,
+        "single_camera": args.single_camera,
+        "matcher": args.matcher,
+        "max_num_features": args.max_num_features,
+        "reconstruction_name": args.reconstruction_name,
+        "vocab_tree_path": args.vocab_tree_path,
+        "params": {
+            prefix: {k: v for k, v in opts.items() if v is not None}
+            for prefix, opts in sfm_opts.items()
+        },
     }
 
     # Add sparse reconstruction details if available
@@ -922,6 +1105,35 @@ Examples:
         ),
     )
 
+    # ---- SfM: feature extraction / matching / mapper tunables.
+    # One argparse group per COLMAP namespace, registered in a loop so the CLI
+    # flag name and the COLMAP option it maps to stay spelled together.
+    sfm_group_help = {
+        "sift": "转发给 --FeatureExtraction.* / --SiftExtraction.*。不传则用 COLMAP 默认。",
+        "match": "转发给 --SiftMatching.*，对四种匹配器都生效。不传则用 COLMAP 默认。",
+        "tv": "转发给 --TwoViewGeometry.*，对四种匹配器都生效。不传则用 COLMAP 默认。",
+        "seq": "转发给 --SequentialMatching.*，仅 --matcher sequential 时生效。",
+        "mapper": "转发给 --Mapper.*（注册 / 三角化 / 滤波）。不传则用 COLMAP 默认。",
+        "mapper_ba": "转发给 --Mapper.ba_*（束调整）。不传则用 COLMAP 默认。",
+    }
+    for prefix, title, group in SFM_PARAM_GROUPS:
+        grp = parser.add_argument_group(title, sfm_group_help[prefix])
+        for name, (typ, _colmap_opt, help_text) in group.items():
+            grp.add_argument(f"--{prefix}_{name}", type=typ, default=None, help=help_text)
+
+    # Opaque blob the backend hands over; written next to the dense workspace it
+    # describes. Deliberately not parsed here -- the backend owns the format, so
+    # there is exactly one implementation of the fingerprint.
+    parser.add_argument(
+        "--sfm_stamp_json",
+        type=str,
+        default=None,
+        help=(
+            "后端生成的不透明 JSON 戳；undistort 成功后原样写入 "
+            f"<dense_dir>/{SFM_STAMP_FILENAME}。请勿手工设置。"
+        ),
+    )
+
     # ---- Output control ----
     parser.add_argument(
         "--convert_output_suffix",
@@ -978,6 +1190,10 @@ def main(argv: list[str] | None = None) -> int:
     # None values are dropped by append_opt, so COLMAP's own default applies.
     patch_match_opts, fusion_opts = collect_mvs_opts(args)
 
+    # Same for the sparse stage: one dict per COLMAP namespace, with the None
+    # entries dropped by append_group_opts.
+    sfm_opts = collect_sfm_opts(args)
+
     # ---- Validate inputs ----
     image_dir = args.image_dir.resolve()
     output_dir = args.output_dir.resolve()
@@ -1023,6 +1239,10 @@ def main(argv: list[str] | None = None) -> int:
         + sum(1 for v in fusion_opts.values() if v is not None)
     )
     print(f"  MVS overrides:  {n_overrides} (rest use COLMAP defaults)")
+    n_sfm_overrides = sum(
+        1 for opts in sfm_opts.values() for v in opts.values() if v is not None
+    )
+    print(f"  SfM overrides:  {n_sfm_overrides} (rest use COLMAP defaults)")
     print("=" * 60)
 
     # ---- Run pipeline steps ----
@@ -1037,6 +1257,7 @@ def main(argv: list[str] | None = None) -> int:
             use_gpu=bool(args.use_gpu),
             gpu_index=args.gpu_index,
             max_num_features=args.max_num_features,
+            sift_opts=sfm_opts["sift"],
             log_file=log_file,
         ),
         "match": lambda: step_match(
@@ -1045,10 +1266,15 @@ def main(argv: list[str] | None = None) -> int:
             use_gpu=bool(args.use_gpu),
             gpu_index=args.gpu_index,
             vocab_tree_path=args.vocab_tree_path,
+            match_opts=sfm_opts["match"],
+            tv_opts=sfm_opts["tv"],
+            seq_opts=sfm_opts["seq"],
             log_file=log_file,
         ),
         "sfm": lambda: step_sfm(
             database_path, image_dir, sparse_dir,
+            mapper_opts=sfm_opts["mapper"],
+            mapper_ba_opts=sfm_opts["mapper_ba"],
             log_file=log_file,
         ),
         "undistort": lambda: step_undistort(
@@ -1056,6 +1282,7 @@ def main(argv: list[str] | None = None) -> int:
             reconstruction_name=args.reconstruction_name,
             max_image_size=args.undistort_max_image_size,
             num_patch_match_src_images=args.num_patch_match_src_images,
+            sfm_stamp_json=args.sfm_stamp_json,
             log_file=log_file,
         ),
         "reuse": lambda: step_reuse_dense(

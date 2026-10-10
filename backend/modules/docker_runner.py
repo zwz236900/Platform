@@ -9,13 +9,51 @@ from pathlib import Path
 
 from modules.docker_logger import LOG_DIR as DOCKER_LOG_DIR, start_follow
 from modules.logger import get_logger
-from modules.models import ColmapMVSParams
+from modules.models import ColmapMVSParams, ColmapSFMParams
 
 logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+#: What --steps expands to when the caller does not say.
+DEFAULT_STEPS = ("extract", "match", "sfm", "undistort", "mvs")
+
+#: Stages that read the sparse-reconstruction tunables -- feature extraction,
+#: matching and the mapper each consume a different slice of ColmapSFMParams.
+#: A run has to include at least one for the flags to mean anything.
+SFM_STAGES = {"extract", "match", "sfm"}
+
+#: Stages that send the dense workspace somewhere other than <output_dir>/dense.
+#: See _stamp_worthy.
+_DENSE_REDIRECT_STEPS = {"mvs", "fusion"}
+
+
+def _stamp_worthy(step_set: set[str]) -> bool:
+    """Whether an SfM fingerprint stamp would be both meaningful and honest.
+
+    The stamp goes into whatever directory ``step_undistort`` writes, while the
+    MVS page reads it from ``<output_dir>/dense`` and sfm_cli.py's ``reuse`` step
+    copies from there too. Those two are the same directory only when no MVS
+    step is in the run: any MVS step redirects the dense workspace to
+    ``MVS_output/<type>`` through ``--dense_dir``.
+
+    So a stamp needs all three of:
+
+    * every stage the fingerprint covers actually ran (otherwise it would vouch
+      for parameters that were never applied), and
+    * ``undistort`` ran (it is the step that produces the workspace and writes
+      the stamp -- without it there is nothing to describe), and
+    * no MVS stage ran (otherwise the workspace just built is not the one the
+      stamp would land in, and stamping ``<output_dir>/dense`` instead would
+      attest a directory this run never touched).
+    """
+    return (
+        SFM_STAGES <= step_set
+        and "undistort" in step_set
+        and not (step_set & _DENSE_REDIRECT_STEPS)
+    )
 
 CONTAINER_NAME = "colmap-dev"
 SFM_CLI_PATH = "/colmap/sfm_cli.py"         # path inside container
@@ -44,6 +82,8 @@ def build_sfm_command(
     mvs_type: str = "colmap",
     reuse_dense_dir: str | None = None,
     mvs_params: ColmapMVSParams | None = None,
+    sfm_params: ColmapSFMParams | None = None,
+    sfm_stamp_json: str | None = None,
 ) -> list[str]:
     """Build the docker exec command to run sfm_cli.py inside the container.
 
@@ -55,7 +95,10 @@ def build_sfm_command(
     image_dir = DATA_DIR_CONTAINER / project_name / "Input" / "input_image"
     output_dir = DATA_DIR_CONTAINER / project_name / "SFM_output"
 
-    steps_str = ",".join(steps) if steps else "extract,match,sfm,undistort,mvs"
+    steps_str = ",".join(steps) if steps else DEFAULT_STEPS
+    # None means "the whole pipeline" (see steps_str above), so expand it here
+    # too rather than letting the gating checks below read an empty set.
+    step_set = set(steps) if steps else set(DEFAULT_STEPS)
 
     cmd = [
         # 以宿主用户身份运行，保证 /data 产物归属 zwz（容器默认 root，产物后端删不掉）
@@ -87,6 +130,24 @@ def build_sfm_command(
         # applies and an all-None model leaves the command byte-identical.
         if mvs_params is not None:
             cmd += mvs_params.cli_args()
+
+    # Sparse-reconstruction tunables, same contract as the MVS ones above: they
+    # only matter to the stages that consume them, and unset fields produce no
+    # flag so an all-None model leaves the command byte-identical.
+    if sfm_params is not None and step_set & SFM_STAGES:
+        cmd += sfm_params.cli_args()
+
+    # Only a run that rebuilds the sparse model *and* writes it to
+    # <output_dir>/dense gets a stamp -- see _stamp_worthy. Deciding here rather
+    # than at the call site means no caller can hand the CLI a stamp that would
+    # describe something other than what the MVS page later reads.
+    if sfm_stamp_json:
+        if _stamp_worthy(step_set):
+            cmd += ["--sfm_stamp_json", sfm_stamp_json]
+        else:
+            logger.warning(
+                "Dropping SfM stamp for steps %s: they do not produce "
+                "<output_dir>/dense from a full sparse rebuild", sorted(step_set))
 
     # reuse step: reuse the SfM undistort output (SFM_output/dense) so COLMAP MVS
     # skips a redundant image_undistorter pass and runs only patch_match + fusion.
