@@ -77,6 +77,7 @@ Input/input_image/  ──►  SfM 稀疏重建 ──►  SFM_output/sparse/0 +
 |---|---|---|---|
 | 项目管理 / 上传 | 用户选图（可 zip） | FastAPI 直接落盘 + exiftool 去 IPTC/EXIF | `Input/input_image/` |
 | SfM | `input_image/` | colmap-dev · `sfm_cli.py`（extract→match→sfm） | `SFM_output/sparse/0` · `database.db` · `pipeline_result.json` · `pipeline.log` |
+| 稀疏点云导出 | `SFM_output/sparse/0`（points3D） | 进程内 `common.ensure_sparse_ply`（下载时触发） | `SFM_output/sparse/0/points3D.ply` |
 | 去畸变（可选） | `input_image/` + `sparse/0` | colmap `image_undistorter` | `SFM_output/undistorted/`（images + PINHOLE sparse） |
 | MVS 稠密 | `sparse/0`（colmap）或 `SFM_output`（openmvs） | colmap patch_match/fuse 或 openmvs `mvs_cli.py` | `MVS_output/colmap/fused.ply` 或 `openmvs/scene_dense.ply` |
 | SAM 分割 | `input_image/` | sam3 · 批量 `SAM_CLI.py` / 交互常驻 `sam_worker.py` | `SAM_output/`：`mask*.png` · `manifest.json` · `box_results/` · `point_results/` · `point_marks/` |
@@ -170,6 +171,8 @@ Input/input_image/  ──►  SfM 稀疏重建 ──►  SFM_output/sparse/0 +
 | POST | `/api/projects/{p}/stop` | 终止子进程 + 状态置 failed |
 | GET | `/api/projects/{p}` | 轮询中每第 5 次（≈15s）查状态 |
 | GET | `/api/projects/{p}/log?lines=40` | 每 3s 整体替换日志框（切页保持轮询） |
+| GET | `/api/projects/{p}/sfm/files` | 切项目 / pipeline 完成 / 点刷新；填充下载下拉框 |
+| GET | `/api/projects/{p}/sfm/download/{file}` | 私有下载管理器落盘（稀疏点云 PLY 由后端按需导出） |
 
 **MVS 重建 `mvs.py`**
 
@@ -250,6 +253,7 @@ Input/input_image/  ──►  SfM 稀疏重建 ──►  SFM_output/sparse/0 +
 ├── SFM_output/                  ← SfM · colmap-dev
 │   ├── database.db
 │   ├── sparse/0/                ← 稀疏模型 cameras/images/points3D
+│   │   └── points3D.ply         ← 稀疏点云（首次下载时由后端就地导出）
 │   ├── undistorted/             ← 去畸变 images/ + sparse（PINHOLE）
 │   ├── dense/                   ← colmap 稠密旧布局（fused.ply 等）
 │   ├── pipeline_result.json

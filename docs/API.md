@@ -165,6 +165,44 @@ undistorted/
 |------|------|------|
 | `filename` | `path` | SFM_output 下的相对路径，如 `fused.ply`、`pipeline_result.json` |
 
+### `GET /api/projects/{project_name}/sfm/files`
+
+列出 SFM_output 里可下载的产物（SfM 页面下载区的数据源）。稀疏点云按
+`sparse/<重建名>/` 逐个列出，重建名不做限制（COLMAP 可能产出 0/1/… 多个模型）。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `step` | `str` | 产物所属步骤，如 `稀疏重建` / `运行结果` / `运行日志` |
+| `label` | `str` | 展示用名称（稀疏点云附带点数） |
+| `path` | `str` | 相对 SFM_output 的路径，直接用于下载端点 |
+| `generated` | `bool` | 仅稀疏点云有：PLY 是否已落盘（未落盘时首次下载会自动导出） |
+
+**响应**
+```json
+{
+  "project_name": "xxx",
+  "products": [
+    {"step": "稀疏重建", "label": "稀疏点云 0（11,838 点）",
+     "path": "sparse/0/points3D.ply", "generated": false},
+    {"step": "稀疏重建", "label": "sparse/0/points3D.bin", "path": "sparse/0/points3D.bin"},
+    {"step": "运行日志", "label": "pipeline.log", "path": "pipeline.log"}
+  ]
+}
+```
+
+### `GET /api/projects/{project_name}/sfm/download/{filename:path}`
+
+下载 SFM_output 目录下的产物，与上面的通用下载端点同义，额外支持**按需导出稀疏点云**。
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `filename` | `path` | SFM_output 下的相对路径，如 `sparse/0/points3D.ply` |
+
+`sparse/<重建名>/points3D.ply` 是派生产物：磁盘上还没有时，后端用同目录的 COLMAP
+稀疏模型（`points3D.bin` / `points3D.txt`）在进程内就地导出（不经容器，见
+`algorithm/common.py:ensure_sparse_ply`），随后作为普通文件回传；源模型更新后再次下载会
+自动重新导出。源模型不存在时返回 404。
+
 ---
 
 ## SAM

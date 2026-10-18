@@ -25,6 +25,7 @@ from modules.docker_runner import (
     run_pipeline_async,
 )
 from modules.image_preprocessor import strip_metadata, undistort_images
+from algorithm.common import SPARSE_PLY_NAME, count_points3D, ensure_sparse_ply
 from algorithm.pointcloud_filter import run as run_pointcloud_filter
 from algorithm.image_mask import run as run_image_mask
 from algorithm.mask_obj import run as run_mask_obj
@@ -1097,6 +1098,79 @@ async def download_file(project_name: str, filename: str):
 
     file_path = out_dir / safe_path
     if not file_path.exists():
+        raise HTTPException(404, f"File not found: {filename}")
+
+    return FileResponse(file_path, filename=Path(filename).name,
+                        media_type="application/octet-stream")
+
+
+@app.get("/api/projects/{project_name}/sfm/files")
+async def list_sfm_files(project_name: str):
+    """List SFM_output 可下载产物（稀疏点云 PLY / 稀疏模型 / 结果 / 日志）。
+
+    稀疏点云按 `sparse/<重建名>/` 逐个列出，重建名不做限制（colmap 可能产出
+    0/1/… 多个模型），因此这里没有需要校验的路径参数。PLY 由下载端点按需导出，
+    磁盘上还没有时同样列出，`generated` 标记它当前是否已经落盘。
+    """
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    out_dir = _sfm_output_dir(project_name)
+    products: list[dict] = []
+
+    sparse_dir = out_dir / "sparse"
+    if sparse_dir.is_dir():
+        for model_dir in sorted(d for d in sparse_dir.iterdir() if d.is_dir()):
+            rel = f"sparse/{model_dir.name}"
+            num_points = count_points3D(model_dir)
+            if num_points:
+                products.append({
+                    "step": "稀疏重建",
+                    "label": f"稀疏点云 {model_dir.name}（{num_points:,} 点）",
+                    "path": f"{rel}/{SPARSE_PLY_NAME}",
+                    "generated": (model_dir / SPARSE_PLY_NAME).is_file(),
+                })
+            for name in ("cameras.bin", "images.bin", "points3D.bin"):
+                if (model_dir / name).is_file():
+                    products.append({
+                        "step": "稀疏重建",
+                        "label": f"{rel}/{name}",
+                        "path": f"{rel}/{name}",
+                    })
+
+    for name, step in (("pipeline_result.json", "运行结果"),
+                       ("pipeline.log", "运行日志"),
+                       ("database.db", "特征数据库")):
+        if (out_dir / name).is_file():
+            products.append({"step": step, "label": name, "path": name})
+
+    return {"project_name": project_name, "products": products}
+
+
+@app.get("/api/projects/{project_name}/sfm/download/{filename:path}")
+async def download_sfm_file(project_name: str, filename: str):
+    """Download a result file from SFM_output directory.
+
+    `points3D.ply` 是派生产物：磁盘上还没有时，用同目录的 COLMAP 稀疏模型就地
+    导出（进程内转换，不经容器，见 algorithm.common.ensure_sparse_ply），再当作
+    普通文件回传。其余文件直接读盘。
+    """
+    p = get_project(project_name)
+    if p is None:
+        raise HTTPException(404, "Project not found")
+
+    out_dir = _sfm_output_dir(project_name)
+    safe_path = os.path.normpath(filename)
+    if safe_path.startswith("..") or safe_path.startswith("/"):
+        raise HTTPException(400, "Invalid filename")
+
+    file_path = out_dir / safe_path
+    if not file_path.is_file() and file_path.name == SPARSE_PLY_NAME:
+        exported = await asyncio.to_thread(ensure_sparse_ply, file_path.parent)
+        if exported is not None:
+            file_path = exported
+    if not file_path.is_file():
         raise HTTPException(404, f"File not found: {filename}")
 
     return FileResponse(file_path, filename=Path(filename).name,

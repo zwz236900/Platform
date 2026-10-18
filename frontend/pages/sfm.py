@@ -1,8 +1,9 @@
-"""SfM 重建页面 — 参数配置与 pipeline 启动."""
+"""SfM 重建页面 — 参数配置、pipeline 启动与产物下载."""
 
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 
 from PySide6.QtWidgets import (
     QLabel,
@@ -18,10 +19,12 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QTextEdit,
     QMessageBox,
+    QFileDialog,
     QSizePolicy,
     QWidget,
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 from PySide6.QtGui import QFont
 
 from .base_page import BasePage
@@ -33,6 +36,8 @@ from widgets.sfm_advanced_dialog import SfmAdvancedDialog, count_overrides
 # 常量
 # ---------------------------------------------------------------------------
 
+API_BASE = "http://localhost:8000"
+
 MATCHERS = ["exhaustive", "sequential", "vocab_tree", "spatial"]
 CAMERA_MODELS = ["SIMPLE_RADIAL", "PINHOLE", "SIMPLE_PINHOLE", "RADIAL", "OPENCV"]
 
@@ -42,6 +47,17 @@ STEP_LABELS = {
     "sfm": "稀疏重建",
     "undistort": "去畸变",
 }
+
+
+def _format_size(n: int) -> str:
+    """人类可读的文件大小。"""
+    if n >= 1 << 30:
+        return f"{n / (1 << 30):.2f} GB"
+    if n >= 1 << 20:
+        return f"{n / (1 << 20):.2f} MB"
+    if n >= 1 << 10:
+        return f"{n / (1 << 10):.1f} KB"
+    return f"{n} B"
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +74,11 @@ class SfMPage(BasePage):
         self._api.finished.connect(self._on_response)
         self._state = ProjectState.instance()
         self._state.current_changed.connect(self._on_shared_project_changed)
+
+        # 独立下载管理器（下载二进制产物，避免干扰 JSON 解析）
+        self._dl_mgr = QNetworkAccessManager(self)
+        self._dl_mgr.finished.connect(self._on_download_finished)
+
         self._running = False
         self._current_project = ""
         self._poll_timer = QTimer(self)
@@ -202,6 +223,38 @@ class SfMPage(BasePage):
         self.progress.setVisible(False)
         self.content_layout.addWidget(self.progress)
 
+        # ── 下载区 ──（与 MVS 页面同构：后端列产物 → 下拉选择 → 存到本地）
+        dl_group = QGroupBox("下载产物")
+        dl_form = QFormLayout(dl_group)
+
+        dl_row = QHBoxLayout()
+        self.dl_file_combo = QComboBox()
+        self.dl_file_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        dl_row.addWidget(self.dl_file_combo, 1)
+
+        self.dl_refresh_btn = QPushButton("🔄")
+        self.dl_refresh_btn.setObjectName("actionBtn")
+        self.dl_refresh_btn.setFixedSize(34, 26)
+        self.dl_refresh_btn.setToolTip("重新扫描 SFM_output 里的产物")
+        self.dl_refresh_btn.clicked.connect(self._update_download_files)
+        dl_row.addWidget(self.dl_refresh_btn)
+        dl_form.addRow("文件:", dl_row)
+
+        dl_btn_row = QHBoxLayout()
+        self.download_btn = QPushButton("⬇ 下载")
+        self.download_btn.setObjectName("actionBtn")
+        self.download_btn.setMinimumWidth(100)
+        self.download_btn.setToolTip("把选中的产物保存到本地")
+        self.download_btn.clicked.connect(self._on_download)
+        dl_btn_row.addWidget(self.download_btn)
+        dl_btn_row.addStretch()
+        self._dl_status = QLabel("")
+        self._dl_status.setStyleSheet("color:#8b949e; font-size:12px;")
+        dl_btn_row.addWidget(self._dl_status)
+        dl_form.addRow("", dl_btn_row)
+
+        self.content_layout.addWidget(dl_group)
+
         # ── 日志 ──
         log_header = QHBoxLayout()
         log_header.addWidget(QLabel("运行日志"))
@@ -232,6 +285,8 @@ class SfMPage(BasePage):
         """下拉框变化（用户选择 / 共享同步）→ 广播到全局。"""
         self._state.set_current(project)
         self._current_project = project
+        # 产物列表随项目走，切项目后立刻重新扫一遍
+        self._update_download_files()
 
     def _on_shared_project_changed(self, project: str):
         """其余页面选中了项目 → 同步本页下拉框。
@@ -332,6 +387,82 @@ class SfMPage(BasePage):
         self._api.post(f"/api/projects/{project}/stop", tag="stop_pipeline")
 
     # ------------------------------------------------------------------
+    # 下载
+    # ------------------------------------------------------------------
+
+    def _update_download_files(self):
+        """从后端读 SFM_output 里实际存在的产物，填充下载下拉框。"""
+        if getattr(self, "dl_file_combo", None) is None:
+            return
+        project = self._current_project or self.project_combo.currentText().strip()
+        self.dl_file_combo.clear()
+        if not project:
+            self.dl_file_combo.addItem("请先选择项目", "")
+            return
+        self._api.get(f"/api/projects/{project}/sfm/files", tag="sfm_files")
+
+    def _on_download(self):
+        if not self._current_project:
+            QMessageBox.warning(self, "提示", "请先选择一个项目。")
+            return
+        rel_path = self.dl_file_combo.currentData()
+        if not rel_path:
+            QMessageBox.warning(self, "提示", "暂无可下载的产物，请先运行重建。")
+            return
+
+        # 产物在 SFM_output 里是嵌套路径（sparse/0/points3D.ply），落盘时取末段命名
+        filename = Path(rel_path).name
+        default_name = f"{self._current_project}_{filename}"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存 SfM 产物",
+            default_name,
+            "点云 / 模型 (*.ply *.bin *.json *.log *.db);;所有文件 (*)",
+        )
+        if not path:
+            return
+
+        self.download_btn.setEnabled(False)
+        self.download_btn.setText("⏳ 下载中...")
+        # 稀疏点云 PLY 由后端首次导出，会多花一点时间——先说明白，避免像卡死
+        self._dl_status.setText(f"下载 {filename} ...")
+        self._log_msg(f"⬇ 正在下载 SfM 产物 → {path}")
+
+        url = QUrl(
+            f"{API_BASE}/api/projects/{self._current_project}/sfm/download/{rel_path}"
+        )
+        req = QNetworkRequest(url)
+        reply = self._dl_mgr.get(req)
+        reply.setProperty("_save_path", path)
+        reply.setProperty("_filename", filename)
+
+    def _on_download_finished(self, reply: QNetworkReply):
+        save_path = reply.property("_save_path")
+        filename = reply.property("_filename")
+        self.download_btn.setEnabled(True)
+        self.download_btn.setText("⬇ 下载")
+        self._dl_status.setText("")
+        try:
+            if reply.error() != QNetworkReply.NoError:
+                err_text = bytes(reply.readAll()).decode("utf-8", errors="replace")
+                self._log_msg(f"✗ 下载失败: {err_text or reply.errorString()}")
+                QMessageBox.warning(self, "下载失败", str(err_text or reply.errorString()))
+                return
+            data = bytes(reply.readAll())
+            with open(save_path, "wb") as f:
+                f.write(data)
+            self._dl_status.setText(f"✓ {_format_size(len(data))}")
+            self._log_msg(
+                f"✅ 下载完成: {filename} ({_format_size(len(data))}) → {save_path}")
+            # 首次下载会就地生成 points3D.ply，刷新一下让「已生成」状态跟上
+            self._update_download_files()
+        except OSError as e:
+            self._log_msg(f"✗ 写入文件失败: {e}")
+            QMessageBox.warning(self, "下载失败", str(e))
+        finally:
+            reply.deleteLater()
+
+    # ------------------------------------------------------------------
     # 轮询日志
     # ------------------------------------------------------------------
 
@@ -379,6 +510,21 @@ class SfMPage(BasePage):
             # fill 期间屏蔽了信号：若全局选中项与下拉框现值不同，手动同步 _current_project
             if selected != previous:
                 self._on_project_changed(selected)
+            else:
+                # 项目没变 → 上面不会触发刷新（例如切回本页）；产物仍要重扫
+                self._update_download_files()
+
+        # ── 产物列表 ──
+        elif tag == "sfm_files":
+            self.dl_file_combo.clear()
+            if not error:
+                for prod in payload.get("products", []):
+                    self.dl_file_combo.addItem(
+                        f"{prod.get('step', '')} · {prod.get('label', '')}",
+                        prod.get("path", ""),
+                    )
+            if self.dl_file_combo.count() == 0:
+                self.dl_file_combo.addItem("暂无产物，请先运行重建", "")
 
         # ── Pipeline 启动响应 ──
         elif tag == "run_pipeline":
@@ -456,6 +602,8 @@ class SfMPage(BasePage):
                 self._log_msg(f"✓ Pipeline 完成 — 耗时 {elapsed:.0f}s")
                 self._status_label.setText("✓ Pipeline 已完成")
                 self._poll_timer.stop()
+                # 本轮新产出的稀疏点云 / 模型 / 日志，刷新下载列表
+                self._update_download_files()
             elif status in ("failed",):
                 self._set_running(False)
                 err = payload.get("error_message", "未知错误")

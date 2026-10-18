@@ -1,8 +1,9 @@
 """Shared utilities for algorithm modules.
 
-- COLMAP binary model reader (cameras.bin, images.bin)
+- COLMAP binary model reader (cameras.bin, images.bin, points3D.bin)
 - PLY point-cloud reader / writer (binary little-endian, float xyz + uchar rgb)
 - Camera projection helpers
+- Sparse point cloud (points3D) → PLY export
 """
 
 import os
@@ -190,6 +191,126 @@ def read_images_text(path: Path) -> dict[int, dict[str, Any]]:
         }
         i += 2  # 跳过紧随其后的 2D 观测行
     return images
+
+
+# --- points3D ---------------------------------------------------------------
+#
+# points3D.bin is a *variable-stride* record stream, unlike cameras/images:
+#
+#     uint64 num_points
+#     per point:
+#         uint64 point3D_id
+#         double x, y, z            (24 B)
+#         uint8  r, g, b            (3 B)
+#         double error              (8 B)
+#         uint64 track_length
+#         uint32 image_id, point2D_idx   × track_length
+#
+# So the byte offset of a record cannot be computed without walking every
+# preceding track. We do that walk once in pure Python (it is a single
+# struct.unpack_from per point), then gather the fields we want with numpy.
+
+#: Bytes of a points3D record that precede its track list.
+_POINTS3D_FIXED_BYTES = 51
+#: Where track_length sits inside those 51 bytes (id 8 + xyz 24 + rgb 3 + err 8).
+_POINTS3D_TRACK_LEN_OFFSET = 43
+#: Bytes each track element adds (image_id + point2D_idx).
+_POINTS3D_TRACK_ELEMENT_BYTES = 8
+#: Bytes we actually keep per record: everything up to and including rgb.
+_POINTS3D_KEEP_BYTES = 35
+
+
+def _points3D_bin_offsets(buf: bytes, num_points: int) -> np.ndarray:
+    """Byte offset of every record in a points3D.bin body."""
+    offsets = np.empty(num_points, dtype=np.int64)
+    off = 8  # skip the uint64 count
+    for i in range(num_points):
+        offsets[i] = off
+        track_len = struct.unpack_from("<Q", buf, off + _POINTS3D_TRACK_LEN_OFFSET)[0]
+        off += _POINTS3D_FIXED_BYTES + _POINTS3D_TRACK_ELEMENT_BYTES * track_len
+    if off != len(buf):
+        raise ValueError(
+            f"points3D.bin is malformed: walked {off} bytes, file has {len(buf)}"
+        )
+    return offsets
+
+
+def read_points3D_bin(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Read a COLMAP points3D.bin → (xyz, rgb).
+
+    Returns:
+        xyz:  (N, 3) float64
+        rgb:  (N, 3) uint8
+    """
+    buf = path.read_bytes()
+    if len(buf) < 8:
+        return np.empty((0, 3)), np.empty((0, 3), dtype=np.uint8)
+
+    num_points = struct.unpack_from("<Q", buf, 0)[0]
+    if num_points == 0:
+        return np.empty((0, 3)), np.empty((0, 3), dtype=np.uint8)
+
+    offsets = _points3D_bin_offsets(buf, num_points)
+    u8 = np.frombuffer(buf, dtype=np.uint8)
+    # Gather only the leading 35 bytes of each record; error/track are dropped
+    # here rather than parsed, since a point cloud only needs xyz + colour.
+    records = u8[offsets[:, None] + np.arange(_POINTS3D_KEEP_BYTES)]
+    xyz = np.ascontiguousarray(records[:, 8:32]).view("<f8")
+    rgb = np.ascontiguousarray(records[:, 32:35])
+    return xyz, rgb
+
+
+def read_points3D_text(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Read a COLMAP points3D.txt → (xyz, rgb).
+
+    每行：POINT3D_ID X Y Z R G B ERROR TRACK[]（TRACK 为成对的 IMAGE_ID POINT2D_IDX）。
+    """
+    xyz_rows: list[list[float]] = []
+    rgb_rows: list[list[int]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 8:
+                continue
+            xyz_rows.append([float(parts[1]), float(parts[2]), float(parts[3])])
+            rgb_rows.append([int(parts[4]), int(parts[5]), int(parts[6])])
+    if not xyz_rows:
+        return np.empty((0, 3)), np.empty((0, 3), dtype=np.uint8)
+    return (np.asarray(xyz_rows, dtype=np.float64),
+            np.asarray(rgb_rows, dtype=np.uint8))
+
+
+def load_sparse_points3D(sparse_dir: Path):
+    """按需读取 COLMAP 稀疏模型的 3D 点（bin 或 txt 自动识别）。
+
+    Returns:
+        (xyz, rgb)；两种格式都不存在时返回 (None, None)。
+    """
+    for name, reader in (("points3D.bin", read_points3D_bin),
+                         ("points3D.txt", read_points3D_text)):
+        if (sparse_dir / name).is_file():
+            return reader(sparse_dir / name)
+    return None, None
+
+
+def count_points3D(sparse_dir: Path) -> int:
+    """稀疏模型的 3D 点数（缺文件返回 0）。
+
+    bin 只读头部 8 字节即可得到总数，因此列产物时可以零成本地展示点数。
+    """
+    bin_path = sparse_dir / "points3D.bin"
+    if bin_path.is_file():
+        with open(bin_path, "rb") as f:
+            head = f.read(8)
+        return struct.unpack("<Q", head)[0] if len(head) == 8 else 0
+    txt_path = sparse_dir / "points3D.txt"
+    if txt_path.is_file():
+        with open(txt_path, "r", encoding="utf-8") as f:
+            return sum(1 for ln in f if ln.strip() and not ln.startswith("#"))
+    return 0
 
 
 def load_sparse_model(sparse_dir: Path):
@@ -420,3 +541,48 @@ def write_ply(
             arr["score"] = scores.astype(np.float32)
 
         arr.tofile(f)
+
+
+# ---------------------------------------------------------------------------
+# 稀疏点云导出（points3D → PLY）
+# ---------------------------------------------------------------------------
+
+#: PLY 写在稀疏模型目录内，与被导出的模型同名同级。
+SPARSE_PLY_NAME = "points3D.ply"
+
+#: COLMAP 稀疏模型的点云源文件（bin 优先）。
+_SPARSE_POINT_SOURCES = ("points3D.bin", "points3D.txt")
+
+
+def ensure_sparse_ply(sparse_model_dir: Path) -> Path | None:
+    """确保 <sparse_model_dir>/points3D.ply 存在，返回其路径。
+
+    在进程内直接把 points3D 转成 PLY（而不是 docker exec
+    ``colmap model_converter --output_type PLY``），因此下载路径不依赖容器，
+    对本次改动之前就重建好的项目同样有效。
+
+    PLY 是写在源文件旁边的派生产物，也是它的缓存：只要 points3D 比 PLY 新
+    就重新导出——SfM 重跑到同一工作区时正是这种情况，旧缓存不能留下。
+
+    Returns:
+        PLY 路径；目录里没有稀疏点云时返回 None。
+    """
+    src_mtime = None
+    for name in _SPARSE_POINT_SOURCES:
+        candidate = sparse_model_dir / name
+        if candidate.is_file():
+            src_mtime = candidate.stat().st_mtime
+            break
+    if src_mtime is None:
+        return None
+
+    ply_path = sparse_model_dir / SPARSE_PLY_NAME
+    if ply_path.is_file() and ply_path.stat().st_mtime >= src_mtime:
+        return ply_path
+
+    xyz, rgb = load_sparse_points3D(sparse_model_dir)
+    if xyz is None or len(xyz) == 0:
+        return None
+
+    write_ply(ply_path, xyz, rgb)
+    return ply_path

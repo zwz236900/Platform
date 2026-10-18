@@ -331,6 +331,8 @@ async function renderProject(name) {
       files.push({n:'database.db', p:'database.db'});
     }
     if (p.pipeline) {
+      // 稀疏点云 PLY 走 /sfm/download：后端在首次下载时从稀疏模型就地导出
+      files.push({n:'稀疏点云 sparse/0/points3D.ply', p:'sparse/0/points3D.ply', sfm:true});
       files.push({n:'sparse/0/cameras.bin', p:'sparse/0/cameras.bin'});
       files.push({n:'sparse/0/images.bin', p:'sparse/0/images.bin'});
       files.push({n:'sparse/0/points3D.bin', p:'sparse/0/points3D.bin'});
@@ -338,6 +340,10 @@ async function renderProject(name) {
     if (p.steps?.mvs?.status === 'ok') files.push({n:'fused.ply', p:'dense/fused.ply'});
 
     const dl = (pn, path) => `/api/projects/${encodeURIComponent(pn)}/download/${encodeURIComponent(path)}`;
+    // 派生产物（目前只有稀疏点云 PLY）走各自的端点，其余仍从 SFM_output 直取
+    const fileHref = (pn, f) => f.sfm
+      ? `/api/projects/${encodeURIComponent(pn)}/sfm/download/${f.p}`
+      : dl(pn, f.p);
     const statusLabels = {pending:'待处理', running:'运行中', completed:'已完成', failed:'失败'};
     const stepLabels = {extract:'特征提取', match:'特征匹配', sfm:'稀疏重建', undistort:'图像去畸变', mvs:'稠密重建', fusion:'点云融合'};
 
@@ -435,7 +441,7 @@ async function renderProject(name) {
     <div class="card">
       <h2><span class="icon">📥</span> 结果下载</h2>
       <div class="dl-list">
-        ${files.length ? files.map(f => `<a href="${dl(p.project_name,f.p)}" download>📥 ${f.n}</a>`).join('') : '<span style="color:var(--muted);font-size:13px">暂无结果，请先运行重建</span>'}
+        ${files.length ? files.map(f => `<a href="${fileHref(p.project_name,f)}" download>📥 ${f.n}</a>`).join('') : '<span style="color:var(--muted);font-size:13px">暂无结果，请先运行重建</span>'}
       </div>
     </div>`;
 
